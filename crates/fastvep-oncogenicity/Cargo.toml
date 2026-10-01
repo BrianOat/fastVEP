@@ -1,0 +1,16 @@
+[package]
+name = "fastvep-oncogenicity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Somatic variant oncogenicity classification (ClinGen/CGC/VICC) for fastVEP"
+
+[dependencies]
+fastvep-core = { workspace = true }
+# For the deserialised supplementary-annotation records only (gnomAD, REVEL, SpliceAI); no germline criterion logic is used.
+fastvep-classification = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
