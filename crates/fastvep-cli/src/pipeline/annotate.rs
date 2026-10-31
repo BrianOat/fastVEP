@@ -55,7 +55,7 @@ pub struct AnnotateConfig {
     pub transcript_cache: Option<String>,
     /// Directory containing supplementary annotation files (.osa, .osi, .oga).
     pub sa_dir: Option<String>,
-    /// Skip the default 49-field CSQ annotation pipeline and emit only
+    /// Skip the default 51-field CSQ annotation pipeline and emit only
     /// supplementary annotations from `--sa-dir`. Requires `sa_dir`.
     pub sa_only: bool,
     /// Enable ACMG-AMP variant classification.
@@ -83,6 +83,8 @@ pub struct AnnotateConfig {
     pub qc_rules: Option<String>,
     /// Show periodic progress output.
     pub show_progress: bool,
+    /// Enable ClinGen/CGC/VICC somatic oncogenicity classification.
+    pub somatic: bool,
 }
 
 /// Everything the per-variant work needs that is fixed for the whole run.
@@ -103,6 +105,7 @@ struct AnnotationContext<'a> {
     gene_providers: &'a [fastvep_sa::gene::GeneIndex],
     acmg_config: Option<&'a fastvep_classification::AcmgConfig>,
     functional_evidence: Option<&'a fastvep_classification::FunctionalEvidenceIndex>,
+    oncogenicity_config: Option<&'a fastvep_oncogenicity::OncogenicityConfig>,
     pick_order: &'a [PickCriterion],
     sample_names: &'a [String],
     /// gnomAD queries need the VCF-style allele rather than fastVEP's
@@ -135,6 +138,7 @@ fn annotate_variant(
         gene_providers,
         acmg_config,
         functional_evidence,
+        oncogenicity_config,
         pick_order,
         sample_names,
         normalize_gnomad_queries,
@@ -289,6 +293,7 @@ fn annotate_variant(
                             polyphen: None,
                             supplementary: Vec::new(),
                             acmg_classification: None,
+                            oncogenicity_classification: None,
                         };
 
                         // Generate HGVS if requested
@@ -616,6 +621,12 @@ fn annotate_variant(
     // for variants overlapping many transcripts. Runs for all variants
     // (intergenic, transcript-overlapping, and sa_only scaffold) so
     // supplementary databases attach to every record that matches.
+    // Per ALT index: whether a gnomAD database that holds this chromosome was
+    // queried for the allele and answered without error. The somatic OP4
+    // criterion reads a gnomAD miss as "absent from controls", and a miss means
+    // that only when this is true - see the oncogenicity pass below. Empty, so
+    // never allocated, unless --somatic is on.
+    let mut gnomad_answered = vec![false; oncogenicity_config.map_or(0, |_| vf.alt_alleles.len())];
     if !sa_providers.is_empty() {
         let chrom = &vf.position.chromosome;
         let sa_queries = vf.query_alleles();
@@ -626,6 +637,8 @@ fn annotate_variant(
                 if allele_results.contains_key(&allele_key) {
                     continue;
                 }
+                let mut gnomad_ok = false;
+                let mut gnomad_failed = false;
                 let (query_pos, ref_str, alt_str) = sa_queries
                     .iter()
                     .find(|(allele, _, _, _)| allele == &allele_key)
@@ -670,7 +683,20 @@ fn annotate_variant(
                         (vf.position.start, "", "")
                     };
                     // A failed lookup is not a miss: see `SaLookupErrors`.
-                    match sa.annotate_position(chrom, sa_pos, sa_ref, sa_alt) {
+                    let lookup = sa.annotate_position(chrom, sa_pos, sa_ref, sa_alt);
+                    // Only a gnomAD database that holds this chromosome can
+                    // answer for it: a per-chromosome shard asked about another
+                    // chromosome returns Ok(None), which is not "no record".
+                    if !gnomad_answered.is_empty()
+                        && sa.json_key() == "gnomad"
+                        && sa.covers_chrom(chrom) == Some(true)
+                    {
+                        match &lookup {
+                            Ok(_) => gnomad_ok = true,
+                            Err(_) => gnomad_failed = true,
+                        }
+                    }
+                    match lookup {
                         Ok(Some(ann)) => {
                             let json_str = match ann {
                                 AnnotationValue::Json(j) => j,
@@ -683,6 +709,11 @@ fn annotate_variant(
                         }
                         Ok(None) => {}
                         Err(e) => fastvep_annotate::sa_lookup_errors().record(sa.json_key(), &e),
+                    }
+                }
+                if gnomad_ok && !gnomad_failed {
+                    if let Some(i) = vf.alt_alleles.iter().position(|a| *a == aa.allele) {
+                        gnomad_answered[i] = true;
                     }
                 }
                 allele_results.insert(allele_key, results);
@@ -776,6 +807,56 @@ fn annotate_variant(
                 );
                 let result = fastvep_classification::classify(&input, acmg_cfg);
                 aa.acmg_classification = serde_json::to_value(&result).ok();
+            }
+        }
+    }
+
+    // Somatic oncogenicity pass. Independent of the ACMG pass: it reads the
+    // same attached annotations and writes its own field.
+    if let Some(onc_cfg) = oncogenicity_config {
+        let query_alleles = vf.query_alleles();
+        for tv in &mut vf.transcript_variations {
+            for aa in &mut tv.allele_annotations {
+                // A missing gnomAD record means "absent" only if the lookup
+                // could have found it, which takes two things.
+                //
+                // First, a gnomAD database that holds this chromosome answered
+                // without error (`gnomad_answered`, set in the SA loop). A
+                // run-wide "gnomAD is loaded" flag is not enough: the SA build
+                // writes one database per chromosome, and a shard asked about a
+                // chromosome it does not hold answers Ok(None), the same as "no
+                // record" - so a chromosome with no shard read as absent.
+                //
+                // Second, the query used a spelling gnomAD stores. Without a
+                // reference the SA loop queries the raw VCF allele, and an
+                // indel there can miss the left-aligned record gnomAD keeps. A
+                // substitution has one spelling and needs no normalising.
+                //
+                // `query_alleles()` is built in `alt_alleles` order, so the ALT
+                // index finds this allele's VCF form directly.
+                let alt_idx = vf.alt_alleles.iter().position(|a| *a == aa.allele);
+                let is_snv = alt_idx
+                    .and_then(|i| query_alleles.get(i))
+                    .is_some_and(|(_, _, r, a)| r.len() == 1 && a.len() == 1);
+                let answered = alt_idx.is_some_and(|i| gnomad_answered[i]);
+                let gnomad_miss_is_absence = answered && (normalize_gnomad_queries || is_snv);
+                let view = fastvep_oncogenicity::AlleleTranscriptView {
+                    consequences: &aa.consequences,
+                    gene_symbol: tv.gene_symbol.as_deref(),
+                    is_canonical: tv.canonical,
+                    amino_acids: aa.amino_acids.as_ref(),
+                    protein_position: aa.protein_position.map(|(s, _)| s),
+                    hgvs_c: aa.hgvsc.as_deref(),
+                    escapes_nmd: aa.escapes_nmd,
+                };
+                let input = fastvep_oncogenicity::extract_oncogenicity_input(
+                    &view,
+                    &aa.supplementary,
+                    &vf.supplementary_annotations,
+                    gnomad_miss_is_absence,
+                );
+                let result = fastvep_oncogenicity::classify(&input, onc_cfg);
+                aa.oncogenicity_classification = serde_json::to_value(&result).ok();
             }
         }
     }
@@ -1114,6 +1195,7 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
             (config.proband.is_some(), "--proband"),
             (config.mother.is_some(), "--mother"),
             (config.father.is_some(), "--father"),
+            (config.somatic, "--somatic"),
         ] {
             if set {
                 eprintln!("warning: --sa-only is set; ignoring {}", name);
@@ -1303,6 +1385,11 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
     } else {
         None
     };
+
+    // Somatic oncogenicity classification. Skipped in --sa-only mode for the
+    // same reason as ACMG: it reads consequences the SA-only path never makes.
+    let oncogenicity_config: Option<fastvep_oncogenicity::OncogenicityConfig> =
+        (config.somatic && !sa_only).then(fastvep_oncogenicity::OncogenicityConfig::default);
 
     // Load optional gene-panel filter (issue #1 ask 4). Loaded once at
     // startup so per-variant filtering is an O(1) HashSet lookup against
@@ -1595,6 +1682,7 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
             gene_providers: &gene_providers,
             acmg_config: acmg_config.as_ref(),
             functional_evidence,
+            oncogenicity_config: oncogenicity_config.as_ref(),
             pick_order: &pick_order,
             sample_names: &sample_names,
             normalize_gnomad_queries,

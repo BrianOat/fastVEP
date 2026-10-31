@@ -133,6 +133,9 @@ pub struct AlleleAnnotation {
     pub supplementary: Vec<(String, String)>,
     /// ACMG-AMP classification result (serialized as serde_json::Value).
     pub acmg_classification: Option<serde_json::Value>,
+    /// ClinGen/CGC/VICC somatic oncogenicity result (serialized as
+    /// serde_json::Value), set under `--somatic`.
+    pub oncogenicity_classification: Option<serde_json::Value>,
 }
 
 /// A known/existing variant from the variation cache.

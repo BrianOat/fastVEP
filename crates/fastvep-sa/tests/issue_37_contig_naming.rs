@@ -176,3 +176,75 @@ fn find_blocks_range_uses_alias_resolution() {
     // A truly unknown contig must still return empty.
     assert!(index.find_blocks_range("chrZZ", 1_000, 2_000).is_empty());
 }
+
+/// `covers_chrom` answers for the chromosomes a database holds, under every
+/// alias the queries accept, and `false` for one it does not hold.
+///
+/// Sources are built one chromosome per file, and a reader asked about a
+/// chromosome it does not carry answers `Ok(None)` - the same as "no record".
+/// The somatic OP4 criterion reads a gnomAD miss as absence, so it has to tell
+/// those apart, and this is what it asks.
+#[test]
+fn covers_chrom_reports_held_contigs_under_their_aliases() {
+    use fastvep_sa::fields::{Field, FieldType};
+    use fastvep_sa::reader_v2::Osa2Reader;
+    use fastvep_sa::writer_v2::{Osa2Metadata, Osa2Record, Osa2Writer};
+
+    // v1 (.osa)
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("v1_chr10");
+    let records = vec![AnnotationRecord {
+        chrom_idx: 0,
+        position: 10266,
+        ref_allele: "A".into(),
+        alt_allele: "G".into(),
+        json: r#"{"allAf":1.0e-5}"#.into(),
+    }];
+    SaWriter::new(gnomad_header())
+        .write_to_files(&base, records.into_iter(), &["chr10".to_string()])
+        .unwrap();
+    let v1 = SaReader::open(&base.with_extension("osa")).unwrap();
+    assert_eq!(v1.covers_chrom("chr10"), Some(true));
+    assert_eq!(v1.covers_chrom("10"), Some(true));
+    assert_eq!(v1.covers_chrom("chr3"), Some(false));
+
+    // v2 (.osa2)
+    let path = dir.path().join("v2_1.osa2");
+    let meta = Osa2Metadata {
+        format_version: 2,
+        name: "gnomAD".into(),
+        version: "v4.1".into(),
+        assembly: "GRCh38".into(),
+        json_key: "gnomad".into(),
+        match_by_allele: true,
+        is_array: false,
+        is_positional: false,
+        chunk_bits: 20,
+        description: "test".into(),
+    };
+    let fields = vec![Field {
+        field: "AC".into(),
+        alias: "allAc".into(),
+        ftype: FieldType::Integer,
+        multiplier: 1,
+        zigzag: false,
+        missing_value: u32::MAX,
+        missing_string: ".".into(),
+        description: String::new(),
+    }];
+    let records = vec![Osa2Record {
+        chrom: "1".into(),
+        position: 10_000,
+        ref_allele: b"A".to_vec(),
+        alt_allele: b"G".to_vec(),
+        values: vec![1],
+        json_blob: None,
+    }];
+    Osa2Writer::new(meta, fields)
+        .write_all(std::fs::File::create(&path).unwrap(), &records)
+        .unwrap();
+    let v2 = Osa2Reader::open(&path).unwrap();
+    assert_eq!(v2.covers_chrom("1"), Some(true));
+    assert_eq!(v2.covers_chrom("chr1"), Some(true));
+    assert_eq!(v2.covers_chrom("chr2"), Some(false));
+}

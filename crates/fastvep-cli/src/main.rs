@@ -90,7 +90,7 @@ enum Commands {
         #[arg(long)]
         sa_dir: Option<String>,
 
-        /// Skip the default 49-field CSQ annotation pipeline (transcript
+        /// Skip the default 51-field CSQ annotation pipeline (transcript
         /// consequence, HGVS, ACMG, VEP variation cache) and emit only
         /// supplementary annotations from --sa-dir. Requires --sa-dir.
         #[arg(long)]
@@ -155,6 +155,14 @@ enum Commands {
         /// Suppress periodic progress output
         #[arg(long, default_value_t = false)]
         no_progress: bool,
+
+        /// Classify somatic oncogenicity (ClinGen/CGC/VICC, Horak 2022).
+        /// Criteria that need sources fastVEP does not yet have (cancer
+        /// hotspots, gene role, curated functional data, tumor type) are
+        /// reported as not evaluable. Uses gnomAD, REVEL, SpliceAI and
+        /// PhyloP from --sa-dir when loaded.
+        #[arg(long, default_value_t = false)]
+        somatic: bool,
     },
 
     /// Launch the web interface for interactive variant annotation
@@ -328,6 +336,7 @@ fn main() -> Result<()> {
             explicit_alleles,
             qc_rules,
             no_progress,
+            somatic,
         } => {
             pipeline::run_annotate(pipeline::AnnotateConfig {
                 input,
@@ -353,6 +362,7 @@ fn main() -> Result<()> {
                 explicit_alleles,
                 qc_rules,
                 show_progress: !no_progress,
+                somatic,
             })?;
         }
         Commands::Cache {

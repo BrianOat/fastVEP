@@ -1,0 +1,26 @@
+# Tools for scripts/build_sa_grch38.sh and scripts/mc3_oncogenicity/run_mc3.sh.
+#
+#   mamba env create -f scripts/mc3_oncogenicity/environment.yml
+#   conda activate fastvep-mc3
+#
+# Pinned to the bioconda releases current when these scripts were written,
+# so a rerun uses the same converter and liftover.
+#
+# Picard rather than CrossMap for the liftover: CrossMap 0.7.4's `vcf` mode
+# re-reads REF over the lifted first base only, so a deletion's REF collapses
+# to one base, equals ALT, and the deletion is dropped; without
+# --ref-consistent it also overwrites a mismatching REF with the target base
+# and keeps the variant (src/cmmodule/mapvcf.py). Picard's LiftoverVcf lifts
+# the whole REF and rejects mismatches to a separate file.
+name: fastvep-mc3
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - vcf2maf=1.6.22   # maf2vcf.pl
+  - samtools=1.24    # required by maf2vcf.pl; also faidx / dict
+  - bcftools=1.24
+  - htslib=1.24      # tabix, bgzip
+  - picard=3.5.0     # LiftoverVcf
+  - unzip=6.0        # REVEL ships as a zip (build_sa_grch38.sh)

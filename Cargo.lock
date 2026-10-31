@@ -443,6 +443,7 @@ dependencies = [
  "fastvep-genome",
  "fastvep-hgvs",
  "fastvep-io",
+ "fastvep-oncogenicity",
  "fastvep-sa",
  "flate2",
  "log",
@@ -509,6 +510,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "fastvep-oncogenicity"
+version = "0.3.0"
+dependencies = [
+ "fastvep-classification",
+ "fastvep-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

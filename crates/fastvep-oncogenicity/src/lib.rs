@@ -1,6 +1,6 @@
 //! Somatic oncogenicity classification for fastVEP.
 //!
-//! Implements the ClinGen / CGC / VICC standard (Horak et al. 2022, PMC9081216): 
+//! Implements the ClinGen / CGC / VICC standard (Horak et al. 2022, PMC9081216):
 //! seventeen criteria (Tables 2 and 3), summed as points,
 //! into five classes from Oncogenic to Benign.
 //!

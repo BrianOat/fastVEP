@@ -92,6 +92,18 @@ pub trait AnnotationProvider: Send + Sync {
     fn preload(&self, _chrom: &str, _positions: &[u64]) -> Result<()> {
         Ok(())
     }
+
+    /// Whether this source holds any data for `chrom`: `Some(true)` or
+    /// `Some(false)` when it can tell, `None` when it cannot.
+    ///
+    /// `annotate_position` answers `Ok(None)` both for "no record here" and for
+    /// a chromosome the source does not carry at all, and sources are routinely
+    /// built one chromosome per file. A caller that reads a miss as evidence -
+    /// "absent from gnomAD" - has to know which of the two it got, and this is
+    /// how it asks. Treat `None` as "not covered".
+    fn covers_chrom(&self, _chrom: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// Trait for providing gene-level annotations (OMIM, pLI scores, etc.).

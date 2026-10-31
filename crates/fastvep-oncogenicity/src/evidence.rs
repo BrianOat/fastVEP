@@ -23,8 +23,8 @@ use crate::types::Strength;
 /// The gene's role in cancer, as curated for the tumor type under
 /// classification.
 ///
-/// Both flags can be set (as both can be true depending on tumor type). 
-/// 
+/// Both flags can be set (as both can be true depending on tumor type).
+///
 /// The SOP's EZH2 example is a gene whose role depends
 /// on tumor type, which is why this belongs to the classification context
 /// rather than to the gene.
@@ -98,8 +98,8 @@ pub enum FunctionalDomainEvidence {
 /// studies (OS2 / SBS2).
 ///
 /// Separate from the germline `FunctionalEvidence` in fastvep-classification on
-/// purpose. OS2/SBS2 ask whether the variant has an oncogenic effect. 
-/// For an activating oncogene variant the answers point in opposite directions, 
+/// purpose. OS2/SBS2 ask whether the variant has an oncogenic effect.
+/// For an activating oncogene variant the answers point in opposite directions,
 /// so one file cannot serve both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OncogenicFunctionalEvidence {

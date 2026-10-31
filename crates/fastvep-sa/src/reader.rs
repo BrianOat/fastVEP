@@ -429,6 +429,15 @@ impl AnnotationProvider for SaReader {
         &self.metadata.name
     }
 
+    fn covers_chrom(&self, chrom: &str) -> Option<bool> {
+        // Same alias resolution as `find_blocks`, so `chr1` and `1` agree.
+        Some(
+            self.index
+                .blocks_for_chrom(chrom)
+                .is_some_and(|b| !b.is_empty()),
+        )
+    }
+
     fn json_key(&self) -> &str {
         &self.metadata.json_key
     }

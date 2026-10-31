@@ -460,6 +460,7 @@ impl AnnotationContext {
                                 polyphen: None,
                                 supplementary: Vec::new(),
                                 acmg_classification: None,
+                                oncogenicity_classification: None,
                             };
 
                             if self.hgvs {
@@ -1029,6 +1030,7 @@ pub fn annotate_sa_only_scaffold(vf: &mut VariationFeature) {
                 polyphen: None,
                 supplementary: Vec::new(),
                 acmg_classification: None,
+                oncogenicity_classification: None,
             }],
             canonical: false,
             strand: fastvep_core::Strand::Forward,
@@ -1079,6 +1081,7 @@ pub fn annotate_intergenic(vf: &mut VariationFeature) {
                 polyphen: None,
                 supplementary: Vec::new(),
                 acmg_classification: None,
+                oncogenicity_classification: None,
             }],
             canonical: false,
             strand: fastvep_core::Strand::Forward,

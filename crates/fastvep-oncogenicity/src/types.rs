@@ -118,7 +118,9 @@ impl CriterionCode {
             Self::Ovs1 | Self::Sbvs1 => Strength::VeryStrong,
             Self::Os1 | Self::Os2 | Self::Os3 | Self::Sbs1 | Self::Sbs2 => Strength::Strong,
             Self::Om1 | Self::Om2 | Self::Om3 | Self::Om4 => Strength::Moderate,
-            Self::Op1 | Self::Op2 | Self::Op3 | Self::Op4 | Self::Sbp1 | Self::Sbp2 => Strength::Supporting,
+            Self::Op1 | Self::Op2 | Self::Op3 | Self::Op4 | Self::Sbp1 | Self::Sbp2 => {
+                Strength::Supporting
+            }
         }
     }
 }

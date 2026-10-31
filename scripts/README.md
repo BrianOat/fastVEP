@@ -7,6 +7,8 @@ Benchmark-specific scripts live in [`analysis/acmg_benchmark/scripts/`](../analy
 |---|---|
 | `check_acmg_stack.py` | Annotates eight real ClinVar variants and reports which supplementary annotation sources actually answered. Exits non-zero when one answers nothing. |
 | `extract_gnomad_scores.py` | Distils SpliceAI and PhyloP databases out of the gnomAD v4.1 sites VCF, so neither needs its own download. |
+| `build_sa_grch38.sh` | Builds a resumable GRCh38 `--sa-dir` (gnomAD v4.1 exomes for given target regions, REVEL, SpliceAI and PhyloP from gnomAD) with a `MANIFEST.json`. |
+| `mc3_oncogenicity/` | Runs the `--somatic` oncogenicity classifier over TCGA MC3. See its [README](mc3_oncogenicity/README.md). |
 | `deploy-minimal.sh` | Human GRCh38 gene models and reference sequence only. |
 | `deploy-clinical.sh` | The clinical deployment: human plus ClinVar and dbSNP. |
 | `deploy-full.sh` | Every organism and every supplementary source. |

@@ -5,9 +5,9 @@
 //! (50) and samples with this amino-acid change (10). The bands are disjoint by
 //! construction, so at most one of them is ever met.
 //!
-//! Horak says that for a tumor type not well covered by CancerHotspots, 
+//! Horak says that for a tumor type not well covered by CancerHotspots,
 //! resources such as COSMIC or a tumor-type-specific study could be used
-//! 
+//!
 //! TODO: Address COSMIC/Tumor Type Implementation
 
 use serde_json::json;

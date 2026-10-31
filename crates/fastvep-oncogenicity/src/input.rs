@@ -52,20 +52,37 @@ pub struct OncogenicityInput {
 /// What gnomAD says about this allele.
 ///
 /// Three states because the absence of a gnomAD record means two different
-/// things. With gnomAD loaded, no record is the finding OP4 asks for. With no
-/// gnomAD database in the run, every variant has no record, and reading that as
-/// "absent from controls" would award OP4 to all of them. The germline PM2
-/// has a config switch for the same ambiguity; here the caller says which case
-/// it is instead.
+/// things. Where the lookup is trustworthy, no record is the finding OP4 asks
+/// for. Where it is not, a miss says nothing, and there are four ways for it
+/// not to be:
+///
+/// - no gnomAD database is loaded, so every variant misses;
+/// - no loaded gnomAD database holds this chromosome - per-chromosome
+///   databases are the usual layout, and a database asked about a chromosome
+///   it doesn't hold answers "no record" just as it does for an absent allele;
+/// - the lookup failed;
+/// - an indel was looked up without the reference normalisation gnomAD's keys
+///   need, and can miss a record that exists.
+///
+/// Reading any of these as "absent from controls" would award OP4 on no
+/// evidence.
+///
+/// One case is not caught: holding a chromosome is not covering every
+/// position on it. A database built only from target regions, or a source
+/// such as gnomAD exomes that was never sequenced outside its capture, can
+/// miss a position it has no data for and still count as having answered.
+/// Catching that would need a coverage track at annotation time. The germline PM2 has a config switch for the same ambiguity; here
+/// the caller says which case it is instead.
 #[derive(Debug, Clone, Default)]
 // One per input and never collected, so the unused space costs nothing; boxing
 // would cost an allocation per allele-transcript on the annotation hot path.
 #[allow(clippy::large_enum_variant)]
 pub enum PopulationEvidence {
-    /// No gnomAD database was loaded for this run.
+    /// No record, and nothing to say the lookup could have found one.
     #[default]
-    NotLoaded,
-    /// gnomAD was loaded and has no record of this allele. (OP4)
+    Unavailable,
+    /// A gnomAD database holding this chromosome answered, in a spelling
+    /// gnomAD stores, and has no record of this allele.
     NoRecord,
     Record(GnomadData),
 }
@@ -93,15 +110,9 @@ impl OncogenicityInput {
             VariantClass::PredictedNull
         } else if self.consequences.iter().any(is_protein_length_change) {
             VariantClass::ProteinLengthChange
-        } else if self
-            .consequences
-            .contains(&Consequence::MissenseVariant)
-        {
+        } else if self.consequences.contains(&Consequence::MissenseVariant) {
             VariantClass::Missense
-        } else if self
-            .consequences
-            .contains(&Consequence::SynonymousVariant)
-        {
+        } else if self.consequences.contains(&Consequence::SynonymousVariant) {
             VariantClass::Synonymous
         } else {
             VariantClass::NoProteinChange

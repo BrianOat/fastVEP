@@ -94,6 +94,8 @@ enum CsqField {
     HgvsOffset,
     Acmg,
     AcmgCriteria,
+    Oncogenicity,
+    OncogenicityCriteria,
     Unknown,
 }
 
@@ -146,6 +148,8 @@ impl CsqField {
             "HGVS_OFFSET" => Self::HgvsOffset,
             "ACMG" => Self::Acmg,
             "ACMG_CRITERIA" => Self::AcmgCriteria,
+            "ONCOGENICITY" => Self::Oncogenicity,
+            "ONCOGENICITY_CRITERIA" => Self::OncogenicityCriteria,
             _ => Self::Unknown,
         }
     }
@@ -362,6 +366,33 @@ fn format_csq_entry_into(
                     }
                 }
             }
+            CsqField::Oncogenicity => {
+                if let Some(ref onc) = aa.oncogenicity_classification {
+                    if let Some(sh) = onc.get("shorthand").and_then(|v| v.as_str()) {
+                        buf.push_str(sh);
+                    }
+                }
+            }
+            CsqField::OncogenicityCriteria => {
+                // Only the criteria that count. Excluded and not-evaluable ones
+                // are in the JSON output, which carries every outcome.
+                if let Some(ref onc) = aa.oncogenicity_classification {
+                    if let Some(criteria) = onc.get("criteria").and_then(|v| v.as_array()) {
+                        let mut first = true;
+                        for c in criteria {
+                            if c.get("outcome").and_then(|v| v.as_str()) == Some("met") {
+                                if let Some(code) = c.get("code").and_then(|v| v.as_str()) {
+                                    if !first {
+                                        buf.push('&');
+                                    }
+                                    first = false;
+                                    buf.push_str(code);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             CsqField::Unknown => {}
         }
     }
@@ -477,6 +508,8 @@ pub const DEFAULT_CSQ_FIELDS: &[&str] = &[
     "TRANSCRIPTION_FACTORS",
     "ACMG",
     "ACMG_CRITERIA",
+    "ONCOGENICITY",
+    "ONCOGENICITY_CRITERIA",
 ];
 
 /// Generate the VCF INFO header line for CSQ.
@@ -2230,6 +2263,10 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
                 if let Some(ref acmg) = aa.acmg_classification {
                     tc.insert("acmg".into(), acmg.clone());
                 }
+                // Oncogenicity classification
+                if let Some(ref onc) = aa.oncogenicity_classification {
+                    tc.insert("oncogenicity".into(), onc.clone());
+                }
                 serde_json::Value::Object(tc)
             })
         })
@@ -2586,6 +2623,7 @@ mod tests {
                     polyphen: None,
                     supplementary,
                     acmg_classification: None,
+                    oncogenicity_classification: None,
                 }],
                 canonical: false,
                 strand: Strand::Forward,

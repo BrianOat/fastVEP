@@ -684,6 +684,10 @@ impl AnnotationProvider for Osa2Reader {
         &self.sa_metadata.name
     }
 
+    fn covers_chrom(&self, chrom: &str) -> Option<bool> {
+        Some(self.resolve_chrom(chrom).is_some())
+    }
+
     fn json_key(&self) -> &str {
         &self.sa_metadata.json_key
     }

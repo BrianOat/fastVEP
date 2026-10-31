@@ -12,6 +12,7 @@ members = [
     "crates/fastvep-classification",
     "crates/fastvep-cli",
     "crates/fastvep-web",
+    "crates/fastvep-oncogenicity",
 ]
 resolver = "2"
 
@@ -33,6 +34,7 @@ fastvep-filter = { path = "crates/fastvep-filter" }
 fastvep-sa = { path = "crates/fastvep-sa" }
 fastvep-annotate = { path = "crates/fastvep-annotate" }
 fastvep-classification = { path = "crates/fastvep-classification" }
+fastvep-oncogenicity = { path = "crates/fastvep-oncogenicity" }
 
 # External crates
 anyhow = "1"
