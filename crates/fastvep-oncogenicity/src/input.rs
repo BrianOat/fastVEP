@@ -19,7 +19,8 @@ use crate::evidence::{
 /// Tumor type is absent altogether. The SOP classifies "in the context of
 /// relevant tumor type(s)", and OP2 cannot be asked without one; nothing in the
 /// pipeline carries it.
-/// //! TODO: Address Tumor Type Implementation
+///
+/// TODO: add a tumor-type field (see OP2 in `criteria/curated.rs`).
 #[derive(Debug, Clone, Default)]
 pub struct OncogenicityInput {
     // ── From the annotation pipeline ────────────────────────────────────

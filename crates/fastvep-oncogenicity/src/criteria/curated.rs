@@ -75,7 +75,9 @@ pub fn evaluate_functional(input: &OncogenicityInput) -> [CriterionResult; 2] {
 ///
 /// A question about the tumor, not the variant, and the pipeline carries no
 /// tumor type.
-/// TODO!!!
+///
+/// TODO: needs a tumor-type input (for MC3, the TCGA project of each sample)
+/// and a curated list of single-etiology malignancies to check it against.
 pub fn evaluate_op2(_input: &OncogenicityInput) -> CriterionResult {
     CriterionResult::not_evaluable(
         CriterionCode::Op2,

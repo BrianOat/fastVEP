@@ -1035,8 +1035,12 @@ fn annotate_variant(ctx: &AnnotationContext<'_>, vf: &mut VariationFeature, know
     }
 
     // Somatic oncogenicity pass. Independent of the ACMG pass: it reads the
-    // same attached annotations and writes its own field.
-    if let Some(onc_cfg) = oncogenicity_config {
+    // same attached annotations and writes its own field. Structural variants
+    // are skipped for the ACMG pass's reason (the SOP classifies sequence
+    // changes, and an SV's rows carry their terms), and for one of its own: a
+    // symbolic allele never matches a gnomAD record, so its miss would read as
+    // absence and award OP4.
+    if let Some(onc_cfg) = oncogenicity_config.filter(|_| vf.sv.is_none()) {
         let query_alleles = vf.query_alleles();
         for tv in &mut vf.transcript_variations {
             for aa in &mut tv.allele_annotations {
