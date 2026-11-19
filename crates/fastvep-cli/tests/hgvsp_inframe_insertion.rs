@@ -8,7 +8,7 @@
 //! VCF on disk, so it fails if the routing regresses anywhere between parsing
 //! the variant and writing the CSQ field.
 
-use fastvep_cli::pipeline::{run_annotate, AnnotateConfig};
+use fastvep_cli::pipeline::{run_annotate, AnnotateConfig, PickFlags};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -54,7 +54,7 @@ fn cli_inframe_insertion_hgvsp_is_normalised_not_a_substitution() {
         gff3: vec![gff3.to_string_lossy().into()],
         fasta: Some(fasta.to_string_lossy().into()),
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: true,
         distance: 5000,
         cache_dir: None,
@@ -72,6 +72,9 @@ fn cli_inframe_insertion_hgvsp_is_normalised_not_a_substitution() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .expect("annotation should succeed");
@@ -97,10 +100,10 @@ fn cli_inframe_insertion_hgvsp_is_normalised_not_a_substitution() {
     // `CGG` inserted after the Trp codon repeats the Arg that follows it, so
     // the HGVS 3'-rule shifts the insertion right and writes the repeat as a
     // duplication -- the value Ensembl VEP reports. Asserting the normalised
-    // form rather than a literal `delinsArgArg` also guards the peptide
-    // reaching this call site: `hgvsp_inframe_indel` falls back to the
-    // unshifted description whenever it has no usable peptide, so a pipeline
-    // that stopped passing `tr.peptide` would fail here.
+    // form rather than a literal `delinsArgArg` also guards the reference
+    // reaching this call site: the 3'-rule is worked out over the genome and
+    // then over the protein, so a pipeline that stopped passing either would
+    // write `p.Trp2_Arg3insArg` here.
     assert!(
         out.contains("p.Arg3dup"),
         "expected a normalised duplication for the in-frame insertion, got:\n{}",

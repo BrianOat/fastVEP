@@ -1,7 +1,9 @@
 use fastvep_core::is_canonical_dinucleotide_offset;
 use fastvep_core::{Consequence, Impact};
-use fastvep_core::{GeneAnnotation, SupplementaryAnnotation};
+use fastvep_core::{GeneAnnotation, HgvsPlacement, SpliceContext, SupplementaryAnnotation};
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 /// gnomAD population frequency data.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -362,100 +364,17 @@ pub struct GnomadGeneData {
     pub syn_z: Option<f64>,
 }
 
-/// OMIM gene-disease data.
+/// A gene's disease annotation: the phenotype strings of the `omim` gene database.
+///
+/// Read through the methods in [`crate::disease`], which parse the ClinGen tag
+/// (`(ClinGen Definitive/AD, MONDO:...)`) that each phenotype of a ClinGen build
+/// carries. The strings are kept as the database stores them so that a gene
+/// record round-trips unchanged.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OmimData {
     #[serde(rename = "mimNumber")]
     pub mim_number: Option<u32>,
     pub phenotypes: Option<Vec<String>>,
-}
-
-impl OmimData {
-    /// True when at least one listed disease meets the SVI evidence threshold -
-    /// a ClinGen classification of Definitive, Strong or Moderate.
-    ///
-    /// The `.oga` carries every classification, including the weak and negative
-    /// ones, because the distinction this method draws is only possible if they
-    /// are present. Reading the classification out of the phenotype string is
-    /// what lets `has_no_valid_relationship` mean "ClinGen looked and found
-    /// little or nothing" rather than "not in the file".
-    ///
-    /// A gene from an OMIM `genemap2` source carries no ClinGen classification
-    /// at all. Those entries count as established: OMIM listing a phenotype is
-    /// the assertion, and the legacy source has no weaker tier to fall back on.
-    pub fn has_established_relationship(&self) -> bool {
-        self.phenotypes.as_ref().is_some_and(|ps| {
-            ps.iter().any(|p| {
-                let t = p.trim();
-                !t.is_empty() && !is_weak_clingen_classification(t)
-            })
-        })
-    }
-
-    /// True when ClinGen curated this gene and concluded there is little or no
-    /// evidence for any of its proposed disease relationships.
-    ///
-    /// This is positive evidence against a gene-disease relationship, and it is
-    /// what the validity gate blocks on. Absence from the file is *not* this:
-    /// ClinGen has reached roughly 2,400 genes, so a gene it has not curated is
-    /// overwhelmingly one nobody got to yet. Treating absence as this cost 1,497
-    /// pathogenic calls in run v10 - SPAST, ABCB11, FLG and LAMB3 among them.
-    pub fn has_no_valid_relationship(&self) -> bool {
-        self.phenotypes
-            .as_ref()
-            .is_some_and(|ps| !ps.is_empty() && !self.has_established_relationship())
-    }
-
-    /// Check if any phenotype suggests autosomal dominant inheritance.
-    ///
-    /// Considers only diseases that met the evidence threshold: the inheritance
-    /// of a relationship ClinGen refuted is not a fact about this gene, and PM2
-    /// and BS2 both branch on it.
-    pub fn has_dominant_inheritance(&self) -> bool {
-        self.phenotypes.as_ref().is_some_and(|ps| {
-            ps.iter()
-                .filter(|p| !is_weak_clingen_classification(p))
-                .any(|p| {
-                    let lower = p.to_lowercase();
-                    lower.contains("autosomal dominant")
-                        || lower.contains("{ad}")
-                        || (lower.contains("dominant") && !lower.contains("recessive"))
-                })
-        })
-    }
-
-    /// Check if any phenotype suggests autosomal recessive inheritance.
-    ///
-    /// Established diseases only, for the same reason as
-    /// [`Self::has_dominant_inheritance`].
-    pub fn has_recessive_inheritance(&self) -> bool {
-        self.phenotypes.as_ref().is_some_and(|ps| {
-            ps.iter()
-                .filter(|p| !is_weak_clingen_classification(p))
-                .any(|p| {
-                    let lower = p.to_lowercase();
-                    lower.contains("autosomal recessive")
-                        || lower.contains("{ar}")
-                        || (lower.contains("recessive") && !lower.contains("dominant"))
-                })
-        })
-    }
-}
-
-/// True for a ClinGen classification that does not meet the SVI evidence
-/// threshold: `Limited`, `Disputed`, `Refuted`, `No Known Disease
-/// Relationship`. Matched inside the `(ClinGen <Class>/<MOI>, MONDO:...)`
-/// suffix the builder writes.
-fn is_weak_clingen_classification(phenotype: &str) -> bool {
-    let Some(rest) = phenotype.split("(ClinGen ").nth(1) else {
-        // No ClinGen tag: an OMIM genemap2 entry. Counts as established.
-        return false;
-    };
-    let class = rest.split('/').next().unwrap_or("").trim();
-    matches!(
-        class,
-        "Limited" | "Disputed" | "Refuted" | "No Known Disease Relationship"
-    )
 }
 
 /// ClinVar variants indexed by protein position (from .oga).
@@ -489,6 +408,53 @@ pub struct ClinvarProteinData {
     /// gene, keyed by genomic position.
     #[serde(rename = "splicePositions", default)]
     pub splice_positions: Vec<ClinvarSpliceVariant>,
+}
+
+/// How many gene records a thread keeps parsed. A sorted input stays in one gene for a
+/// long run and an unsorted one alternates between a few, and the records that
+/// matter are the large ones, so a handful is enough.
+const PARSED_CLINVAR_PROTEIN_KEPT: usize = 4;
+
+thread_local! {
+    /// The gene records this thread parsed last, most recent first: the JSON string
+    /// each came from, and what it parsed to (`None` for a string that is not a record).
+    static PARSED_CLINVAR_PROTEIN: RefCell<Vec<(String, Option<Arc<ClinvarProteinData>>)>> =
+        const { RefCell::new(Vec::new()) };
+    /// How many strings this thread has parsed rather than found, for the tests that hold
+    /// the line on it.
+    #[cfg(test)]
+    static CLINVAR_PROTEIN_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A gene's ClinVar protein index, parsed from the JSON string that the `.oga` reader returned for it.
+///
+/// Every variant of a gene is handed the same string, and the string is as large as the gene's
+/// ClinVar record, which for CFTR or BRCA1 is some hundreds of kilobytes. Parsing it once for
+/// each variant was, on the ClinVar 2-star+ benchmark with `--acmg`, a quarter of the time
+/// the per-variant loop spent (9,105 of 40,941 profile samples), and freeing what it built a
+/// good deal of the rest of what classification cost; a classification needs the index only to read.
+///
+/// A thread therefore keeps the last few strings it parsed with what each gave, and answers a
+/// string equal to one of them, byte for byte, with the same parsed record. Equal strings parse
+/// to equal records, so the answer is the one a fresh parse would give, and a string that is
+/// not equal to any is parsed: nothing is keyed on the gene's name, which a database that is
+/// replaced while the process runs could attach to a different record, and nothing is shared
+/// between threads, so there is no lock to wait for.
+fn parsed_clinvar_protein(json: &str) -> Option<Arc<ClinvarProteinData>> {
+    PARSED_CLINVAR_PROTEIN.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        if let Some(at) = kept.iter().position(|(seen, _)| seen == json) {
+            // Most recent first, so that a run in one gene finds its record at the front.
+            kept[..=at].rotate_right(1);
+            return kept[0].1.clone();
+        }
+        #[cfg(test)]
+        CLINVAR_PROTEIN_PARSES.with(|n| n.set(n.get() + 1));
+        let parsed = serde_json::from_str(json).ok().map(Arc::new);
+        kept.insert(0, (json.to_owned(), parsed.clone()));
+        kept.truncate(PARSED_CLINVAR_PROTEIN_KEPT);
+        parsed
+    })
 }
 
 /// A single classified ClinVar variant sitting on a canonical splice
@@ -561,10 +527,10 @@ pub fn same_splice_position_pathogenic(
         return None;
     }
 
-    let cpd: ClinvarProteinData = gene_annotations
+    let cpd = gene_annotations
         .iter()
         .find(|ga| ga.json_key == "clinvar_protein")
-        .and_then(|ga| serde_json::from_str(&ga.json_string).ok())?;
+        .and_then(|ga| parsed_clinvar_protein(&ga.json_string))?;
     if !cpd.splice_indexed {
         return None;
     }
@@ -729,7 +695,11 @@ pub struct ClassificationInput {
     pub gene_constraints: Option<GnomadGeneData>,
     pub omim: Option<OmimData>,
     /// ClinVar pathogenic variants at protein positions for this gene (from .oga).
-    pub clinvar_protein: Option<ClinvarProteinData>,
+    ///
+    /// Shared between the variants of a gene that a thread classifies in a row, and
+    /// cloned for each mode of inheritance of a gene that has several, so it is read and
+    /// not changed (see `parsed_clinvar_protein`).
+    pub clinvar_protein: Option<Arc<ClinvarProteinData>>,
     /// HGVS c. notation for the variant (e.g. "c.845G>A"). Used by the BA1
     /// exception list lookup (Ghosh 2018) to identify well-known high-AF
     /// pathogenic variants that must not call BA1. `None` if the pipeline
@@ -796,12 +766,12 @@ pub struct ClassificationInput {
     /// same base the acceptor already has, so the intron still ends in AG.
     /// `None` when the pipeline did not supply allele shape.
     pub is_pure_insertion: Option<bool>,
-    /// Whether the variant sits at the first base or last 3 bases of an exon
-    /// (the canonical splice region). Per Walker 2023 (ClinGen SVI Splicing
-    /// Subgroup), BP7 must NOT fire for synonymous variants at these positions
-    /// because SpliceAI can miss splice impact in this region. `None` means
-    /// the pipeline didn't populate this signal (BP7 falls back to legacy
-    /// behavior — fire if SpliceAI low + PhyloP low).
+    /// Whether the variant touches the first base of an exon or one of its last
+    /// three (the canonical splice region). Per Walker 2023 (ClinGen SVI
+    /// Splicing Subgroup), BP7 must NOT fire for synonymous variants at these
+    /// positions because SpliceAI can miss splice impact in this region. `None`
+    /// means the pipeline did not work it out, and BP7 falls back to its legacy
+    /// behaviour: fire if SpliceAI is low and PhyloP is low.
     pub at_exon_edge: Option<bool>,
     /// Signed offset in bp from the nearest exon boundary, for intronic
     /// variants. Convention: positive after the donor (e.g. c.123+5 → +5),
@@ -813,34 +783,30 @@ pub struct ClassificationInput {
     /// Measured against the transcript from the unshifted position, which is
     /// also where the consequence terms are decided, so the two agree: a
     /// variant this calls `+8` does not arrive carrying
-    /// `splice_donor_region_variant`. See [`Self::hgvsc_intronic_offset`] for
-    /// the number the HGVSc shows, which is a different one.
+    /// `splice_donor_region_variant`. See [`Self::hgvs_placement`] for where
+    /// HGVS puts the change, which for an indel in a repeat is a different
+    /// answer.
     pub intronic_offset: Option<i64>,
-    /// The same distance measured at the most 3' position HGVS gives the
-    /// change, which is where it is *numbered* rather than where it is.
+    /// Where HGVS places the change against this transcript, which is where it is
+    /// *numbered* and not where the record sits.
     ///
     /// An indel in a repeat can be written at any of several positions, all of
-    /// which produce the same edited sequence. On a donor the 3' end of that
-    /// range is the one furthest into the intron, so an offset past `+2` there
-    /// **proves the canonical `GT` survives**: some alignment of the change
-    /// leaves `+1` and `+2` alone, and every alignment edits the sequence the
-    /// same way. PVS1's splice track assumes that dinucleotide is destroyed, so
-    /// that is exactly when it must stand down - and it is why the number is
-    /// worth carrying beside [`Self::intronic_offset`] rather than collapsing
-    /// the two.
+    /// which produce the same edited sequence, and HGVS names the most 3'. A
+    /// consequence term is decided from the record's own anchor, so the two can
+    /// disagree about whether the change touches an exon at all, and the
+    /// criteria that read those terms - PVS1, PM4, BP3 and the BP4 splice path -
+    /// are asking about the edited sequence. See
+    /// [`Self::placed_beyond_canonical_splice`] for the placement they act on.
     ///
-    /// PTEN `10:87931087 GAGGT>G` is the shape: `splice_donor_variant` in both
-    /// tools, `c.253+4_253+7del` in both, and the intron still opens `GTATGA`
-    /// after the edit. [`Self::intronic_offset`] reads `+1` there, because that
-    /// is where the change sits and where the consequence term was decided, and
-    /// answering PVS1's question with it turns the gate into a tautology: 97
-    /// splice-donor variants of the ClinVar 2-star+ set collect PVS1 that do
-    /// not today, 47 ClinVar Pathogenic and 6 ClinVar Benign.
+    /// MSH6 `2:47806358 G>GGTAT` is `frameshift_variant` because the record
+    /// anchors on the last base of an exon, and `c.3801+3_3801+6dup`, wholly
+    /// intronic, once HGVS has placed it. PTEN `10:87931087 GAGGT>G` is
+    /// `splice_donor_variant` and `c.253+4_253+7del` in both tools, and the
+    /// intron still opens `GTATGA` after the edit.
     ///
-    /// The shift runs toward the exon on an acceptor, so the same number means
-    /// the nearest approach there and the gate does correspondingly little.
-    /// That asymmetry is HGVS's.
-    pub shifted_intronic_offset: Option<i64>,
+    /// `None` means it was not worked out: see [`reads_hgvs_placement`] for the
+    /// alleles it is worked out for.
+    pub hgvs_placement: Option<HgvsPlacement>,
     /// Proband genotype information (from trio VCF)
     pub proband_genotype: Option<GenotypeInfo>,
     /// Mother genotype information (from trio VCF)
@@ -858,6 +824,79 @@ pub struct ClassificationInput {
     /// matching in the pipeline also leaves the classifier consuming typed
     /// evidence, the same as every other criterion.
     pub functional_evidence: Option<crate::functional::FunctionalEvidence>,
+}
+
+impl ClassificationInput {
+    /// Whether HGVS places the change wholly inside an intron, clear of the
+    /// canonical `±1`/`±2` dinucleotides.
+    ///
+    /// Every placement of the change produces the same edited sequence, so one
+    /// that *can* be written there alters no exon base and no canonical splice
+    /// dinucleotide however the record was anchored. A consequence term that says
+    /// otherwise - `frameshift_variant`, `splice_donor_variant`,
+    /// `inframe_deletion` - is describing the anchor, and the criteria that read
+    /// those terms to ask what the edit does to the protein or to the splice
+    /// site must not act on it.
+    pub fn placed_beyond_canonical_splice(&self) -> bool {
+        self.hgvs_placement
+            .is_some_and(|p| p.is_intronic_beyond_canonical())
+    }
+
+    /// Whether HGVS places the change where a canonical splice term describes
+    /// how the record is anchored and not what the edit does: wholly inside an
+    /// intron past `±2`, or wholly inside an exon and in frame.
+    ///
+    /// These are the placements PVS1's splice track stands down for, and PS1's
+    /// splice path stands down for them too, so that a row with only a splice
+    /// term is never a canonical splice variant to one criterion and not to the
+    /// other. PS1 stands down whatever else the row carries: a coding-null term
+    /// beside the splice one keeps PVS1 for that term, because the placement says
+    /// nothing about whether it is real, and does not keep PS1, which compares
+    /// the dinucleotide the placement shows intact. A change placed wholly inside
+    /// an exon and out of frame is left to the record's terms by both. It leaves the dinucleotide intact as well, but it is a frameshift
+    /// whose record anchors on the splice site, PVS1 keeps it as a null variant
+    /// and PS1 stays with PVS1; docs/ACMG.md has what taking PS1 alone away from
+    /// it would have cost.
+    pub fn splice_term_is_an_anchor_artefact(&self) -> bool {
+        self.hgvs_placement.is_some_and(|p| {
+            p.is_intronic_beyond_canonical()
+                || matches!(p, HgvsPlacement::Exonic { in_frame: true })
+        })
+    }
+}
+
+/// Whether some criterion reads where HGVS places the change for an allele with
+/// these consequence terms.
+///
+/// The annotation pass asks, so that the placement - which walks the reference -
+/// is worked out only where it will be used. The terms are the ones a record's
+/// anchor can produce from bases HGVS places elsewhere: the null terms PVS1
+/// grades and BP4's splice path keeps out, the splice terms PS1's splice path
+/// reads, and the protein-altering terms PM1, PM4, BP3 and BP4 read.
+/// `transcript_ablation` is absent, because a change that removes a whole
+/// transcript has no placement inside one intron.
+pub fn reads_hgvs_placement(consequences: &[Consequence]) -> bool {
+    consequences.iter().any(|c| {
+        matches!(
+            c,
+            Consequence::SpliceAcceptorVariant
+                | Consequence::SpliceDonorVariant
+                | Consequence::StopGained
+                | Consequence::FrameshiftVariant
+                | Consequence::StartLost
+                | Consequence::InframeInsertion
+                | Consequence::InframeDeletion
+                | Consequence::StopLost
+                | Consequence::ProteinAlteringVariant
+        )
+    })
+}
+
+/// Whether some criterion reads [`ClassificationInput::at_exon_edge`] for an
+/// allele with these consequence terms: BP7's exon-edge exclusion applies to a
+/// synonymous change and to nothing else.
+pub fn reads_exon_edge(consequences: &[Consequence]) -> bool {
+    consequences.contains(&Consequence::SynonymousVariant)
 }
 
 /// True when the reference allele is the empty/"-" allele, i.e. the variant is
@@ -881,8 +920,7 @@ pub fn extract_classification_input(
     amino_acids: Option<&(String, String)>,
     protein_position: Option<u64>,
     hgvs_c: Option<&str>,
-    intron_offset: Option<i64>,
-    shifted_intronic_offset: Option<i64>,
+    splice: SpliceContext,
     exon: Option<(u32, u32)>,
     protein_length: Option<u64>,
     escapes_nmd: Option<bool>,
@@ -962,7 +1000,7 @@ pub fn extract_classification_input(
     // Parse gene-level annotations
     let mut gene_constraints = None;
     let mut omim = None;
-    let mut clinvar_protein: Option<ClinvarProteinData> = None;
+    let mut clinvar_protein: Option<Arc<ClinvarProteinData>> = None;
     for ga in gene_annotations {
         match ga.json_key.as_str() {
             "gnomad_genes" | "gnomad_gene" => {
@@ -972,7 +1010,7 @@ pub fn extract_classification_input(
                 omim = serde_json::from_str(&ga.json_string).ok();
             }
             "clinvar_protein" => {
-                clinvar_protein = serde_json::from_str(&ga.json_string).ok();
+                clinvar_protein = parsed_clinvar_protein(&ga.json_string);
             }
             _ => {}
         }
@@ -1005,17 +1043,15 @@ pub fn extract_classification_input(
     // already computes (exon rank/total + HGVS c. notation). ────────────────
     // `is_last_exon`: the variant sits in the 3'-most exon (rank == total).
     let is_last_exon = exon.and_then(|(rank, total)| (total > 0).then_some(rank == total));
-    // `intronic_offset`: signed distance from the nearest exon boundary, `None`
-    // for a change that reaches no intronic base.
-    //
-    // Measured against the transcript by the annotation pass, not parsed out of
-    // the HGVSc. BP7's deep-intronic extension is the criterion that reads it,
-    // and the string it used to read is 3'-shifted: POLE
+    // `intronic_offset` is the signed distance from the nearest exon boundary,
+    // `None` for a change that reaches no intronic base, and it comes in with
+    // `splice`: measured against the transcript by the annotation pass, not
+    // parsed out of the HGVSc. BP7's deep-intronic extension is the criterion
+    // that reads it, and the string it used to read is 3'-shifted: POLE
     // `12:132659279 T>TGGGGGGAGCCCTCACCTCTCCGTGAC` inserts at `c.3275+15` and
     // is written as the duplication it is, `c.3265_3275+15dup`, whose span
     // starts in the exon - so the parsed offset read 1 where the change sits at
     // 15, and BP7 declined.
-    let intronic_offset = intron_offset;
 
     // Both NMD signals are carried, and PVS1 picks between them per config.
     // The last-exon proxy is the historical one; the 50-nt measurement is the
@@ -1086,12 +1122,11 @@ pub fn extract_classification_input(
         variant_coordinates,
         in_repeat_region,
         is_pure_insertion,
-        // BP7 exon-edge / deep-intronic signals (Walker 2023). `intronic_offset`
-        // is derived above; `at_exon_edge` awaits exon-coordinate plumbing and
-        // stays None (BP7 exon-edge exclusion falls back to legacy behavior).
-        at_exon_edge: None,
-        intronic_offset,
-        shifted_intronic_offset,
+        // BP7 exon-edge / deep-intronic signals (Walker 2023), and where HGVS
+        // places an indel, all measured by the annotation pass.
+        at_exon_edge: splice.at_exon_edge,
+        intronic_offset: splice.intron_offset,
+        hgvs_placement: splice.hgvs_placement,
         proband_genotype,
         mother_genotype,
         father_genotype,
@@ -1272,8 +1307,7 @@ mod tests {
             None,
             protein_position,
             None,
-            None, // intron_offset: these unit tests are not splice-site cases
-            None, // shifted_intronic_offset: likewise
+            SpliceContext::default(), // these unit tests are not splice-site cases
             exon,
             protein_length,
             escapes_nmd,
@@ -1290,6 +1324,108 @@ mod tests {
             None,
             vec![],
         )
+    }
+
+    /// A gene record with one pathogenic missense variant at `pos`, so that two
+    /// records differ in what they parse to and not only in their text.
+    fn protein_record(pos: u64) -> String {
+        format!(
+            r#"{{"proteinVariants":[{{"pos":{pos},"refAa":"A","altAa":"G","sig":"Pathogenic","n":1}}],"benignIndexed":true}}"#
+        )
+    }
+
+    fn parses() -> usize {
+        CLINVAR_PROTEIN_PARSES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn test_a_gene_record_is_parsed_once_for_the_variants_that_share_it() {
+        // Every variant of a gene is handed the same JSON string, and parsing it for
+        // each one was a quarter of the per-variant time with `--acmg`.
+        let json = protein_record(100);
+        let before = parses();
+        let first = parsed_clinvar_protein(&json).expect("a valid record");
+        for _ in 0..1_000 {
+            let again = parsed_clinvar_protein(&json).expect("a valid record");
+            assert!(Arc::ptr_eq(&first, &again), "the same parsed record");
+        }
+        assert_eq!(parses() - before, 1, "one parse for 1,001 variants");
+        assert_eq!(first.protein_variants[0].pos, 100);
+    }
+
+    #[test]
+    fn test_a_different_gene_record_is_never_answered_with_a_kept_one() {
+        // The record is found by its text and not by the name of the gene, so a record
+        // that has changed under the same name, or another gene's, parses afresh.
+        let (a, b) = (protein_record(100), protein_record(200));
+        let first = parsed_clinvar_protein(&a).unwrap();
+        let second = parsed_clinvar_protein(&b).unwrap();
+        assert_eq!(first.protein_variants[0].pos, 100);
+        assert_eq!(second.protein_variants[0].pos, 200);
+        // and going back finds the first again, with its own contents
+        let back = parsed_clinvar_protein(&a).unwrap();
+        assert_eq!(back.protein_variants[0].pos, 100);
+        assert!(Arc::ptr_eq(&first, &back));
+    }
+
+    #[test]
+    fn test_genes_that_alternate_are_each_parsed_once_and_never_mixed_up() {
+        // Input that is not sorted alternates between genes. Within what a thread keeps,
+        // each is parsed once; past it, each is parsed again, and none is ever wrong.
+        let records: Vec<String> = (0..PARSED_CLINVAR_PROTEIN_KEPT as u64)
+            .map(|i| protein_record(100 + i))
+            .collect();
+        let before = parses();
+        for round in 0..5 {
+            for (i, json) in records.iter().enumerate() {
+                let parsed = parsed_clinvar_protein(json).unwrap();
+                assert_eq!(
+                    parsed.protein_variants[0].pos,
+                    100 + i as u64,
+                    "round {round}"
+                );
+            }
+        }
+        assert_eq!(parses() - before, records.len(), "each parsed once");
+
+        let many: Vec<String> = (0..PARSED_CLINVAR_PROTEIN_KEPT as u64 + 2)
+            .map(|i| protein_record(500 + i))
+            .collect();
+        for _ in 0..3 {
+            for (i, json) in many.iter().enumerate() {
+                assert_eq!(
+                    parsed_clinvar_protein(json).unwrap().protein_variants[0].pos,
+                    500 + i as u64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_string_that_is_not_a_gene_record_is_none_and_costs_one_parse() {
+        let before = parses();
+        for _ in 0..10 {
+            assert!(parsed_clinvar_protein("not json").is_none());
+        }
+        assert_eq!(parses() - before, 1);
+        assert!(
+            parsed_clinvar_protein(&protein_record(7)).is_some(),
+            "a record after it parses"
+        );
+    }
+
+    #[test]
+    fn test_the_variants_of_a_gene_share_one_index_through_the_real_entry_point() {
+        let json = protein_record(100);
+        let before = parses();
+        let a = extract(None, None, None, None, Some(&json));
+        let b = extract(None, None, None, None, Some(&json));
+        let (a, b) = (a.clinvar_protein.unwrap(), b.clinvar_protein.unwrap());
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(parses() - before, 1);
+        assert!(extract(None, None, None, None, None)
+            .clinvar_protein
+            .is_none());
     }
 
     #[test]
@@ -1519,5 +1655,125 @@ mod tests {
             same_splice_position_pathogenic(&both, &anns, None, 101, "C", "T"),
             Some(true)
         );
+    }
+
+    /// What the annotation pass worked out about where the change sits reaches
+    /// the criteria unchanged, and an unasked answer stays unasked.
+    #[test]
+    fn test_splice_context_reaches_the_input() {
+        let extract_splice = |splice| {
+            extract_classification_input(
+                &[Consequence::SynonymousVariant],
+                Impact::Low,
+                Some("TEST"),
+                true,
+                None,
+                None,
+                None,
+                splice,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                vec![],
+            )
+        };
+        let worked_out = extract_splice(SpliceContext {
+            intron_offset: Some(8),
+            hgvs_placement: Some(HgvsPlacement::Intronic { offset: 8 }),
+            at_exon_edge: Some(true),
+        });
+        assert_eq!(worked_out.intronic_offset, Some(8));
+        assert_eq!(
+            worked_out.hgvs_placement,
+            Some(HgvsPlacement::Intronic { offset: 8 })
+        );
+        assert_eq!(worked_out.at_exon_edge, Some(true));
+        assert!(worked_out.placed_beyond_canonical_splice());
+
+        let unasked = extract_splice(SpliceContext::default());
+        assert_eq!(unasked.intronic_offset, None);
+        assert_eq!(unasked.hgvs_placement, None);
+        assert_eq!(unasked.at_exon_edge, None);
+        assert!(!unasked.placed_beyond_canonical_splice());
+    }
+
+    /// Only an intronic placement past the canonical dinucleotide clears the
+    /// exon and the splice site; an unknown placement is not one.
+    #[test]
+    fn test_placed_beyond_canonical_splice() {
+        let placed = |placement| {
+            let input = ClassificationInput {
+                hgvs_placement: placement,
+                ..crate::test_support::minimal_input()
+            };
+            input.placed_beyond_canonical_splice()
+        };
+        assert!(placed(Some(HgvsPlacement::Intronic { offset: 3 })));
+        assert!(placed(Some(HgvsPlacement::Intronic { offset: -21 })));
+        assert!(!placed(Some(HgvsPlacement::Intronic { offset: 2 })));
+        assert!(!placed(Some(HgvsPlacement::Intronic { offset: -1 })));
+        assert!(!placed(Some(HgvsPlacement::Exonic { in_frame: true })));
+        assert!(!placed(Some(HgvsPlacement::Spans)));
+        assert!(!placed(None));
+    }
+
+    /// The pipeline walks the reference only for the alleles a criterion reads
+    /// the placement for. A term missing here is a criterion that would never be
+    /// handed a placement, so the set is pinned: the null terms PVS1 grades, the
+    /// protein-length terms PM4, BP3 and BP4 read, and nothing else.
+    #[test]
+    fn test_reads_hgvs_placement_covers_exactly_the_terms_criteria_read() {
+        for term in [
+            Consequence::SpliceAcceptorVariant,
+            Consequence::SpliceDonorVariant,
+            Consequence::StopGained,
+            Consequence::FrameshiftVariant,
+            Consequence::StartLost,
+            Consequence::InframeInsertion,
+            Consequence::InframeDeletion,
+            Consequence::StopLost,
+            Consequence::ProteinAlteringVariant,
+        ] {
+            assert!(reads_hgvs_placement(&[term]), "{term:?}");
+            // One term among others is enough.
+            assert!(
+                reads_hgvs_placement(&[Consequence::IntronVariant, term]),
+                "{term:?}"
+            );
+        }
+        for term in [
+            Consequence::MissenseVariant,
+            Consequence::SynonymousVariant,
+            Consequence::IntronVariant,
+            Consequence::SpliceRegionVariant,
+            Consequence::TranscriptAblation,
+            Consequence::UpstreamGeneVariant,
+        ] {
+            assert!(!reads_hgvs_placement(&[term]), "{term:?}");
+        }
+        assert!(!reads_hgvs_placement(&[]));
+    }
+
+    #[test]
+    fn test_only_a_synonymous_change_reads_the_exon_edge() {
+        assert!(reads_exon_edge(&[Consequence::SynonymousVariant]));
+        assert!(reads_exon_edge(&[
+            Consequence::SpliceRegionVariant,
+            Consequence::SynonymousVariant
+        ]));
+        assert!(!reads_exon_edge(&[Consequence::MissenseVariant]));
+        assert!(!reads_exon_edge(&[Consequence::IntronVariant]));
+        assert!(!reads_exon_edge(&[]));
     }
 }

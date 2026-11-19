@@ -1,6 +1,7 @@
+use crate::known::{AlleleKnown, KnownCells};
 use fastvep_core::{
-    Allele, Consequence, GeneAnnotation, GenomicPosition, Impact, Strand, SupplementaryAnnotation,
-    VariantType,
+    Allele, Consequence, GeneAnnotation, GenomicPosition, Impact, SpliceContext, Strand,
+    SupplementaryAnnotation, TranscriptLocation, VariantType,
 };
 use std::sync::Arc;
 
@@ -20,8 +21,11 @@ pub struct VariationFeature {
     pub vcf_fields: Option<VcfFields>,
     /// Transcript-level annotations (populated during annotation).
     pub transcript_variations: Vec<TranscriptVariation>,
-    /// Co-located known variants (populated during annotation).
-    pub existing_variants: Vec<KnownVariant>,
+    /// VEP's known-variant columns (`AF`, `MAX_AF`, `CLIN_SIG`, ...) for each alt
+    /// allele that has any, worked out once per allele because every transcript
+    /// row of the allele reads the same cells. Empty unless a run asks for those
+    /// columns and a known variant matched.
+    pub known: Vec<AlleleKnown>,
     /// Whether the alleles were minimised.
     pub minimised: bool,
     /// Most severe consequence across all transcripts/alleles.
@@ -36,6 +40,16 @@ pub struct VariationFeature {
     pub supplementary_annotations: Vec<SupplementaryAnnotation>,
     /// Gene-level annotations (OMIM, pLI, etc.).
     pub gene_annotations: Vec<GeneAnnotation>,
+}
+
+impl VariationFeature {
+    /// The known-variant cells of an alt allele, if it has any.
+    pub fn known_for(&self, allele: &Allele) -> Option<&KnownCells> {
+        self.known
+            .iter()
+            .find(|k| k.allele == *allele)
+            .map(|k| &k.cells)
+    }
 }
 
 /// Parsed VCF fields for output reconstruction.
@@ -76,44 +90,51 @@ pub struct TranscriptVariation {
     pub flags: Vec<String>,
 }
 
+impl TranscriptVariation {
+    /// The id the placeholder rows carry (`annotate_intergenic`,
+    /// `annotate_sa_only_scaffold`), which no real transcript has.
+    pub const NO_FEATURE: &'static str = "-";
+
+    /// A placeholder row, pushed so that a variant with no overlapping
+    /// transcript still has something to write. It stands for no feature at all.
+    ///
+    /// VEP leaves every feature cell of such a row empty: its intergenic output
+    /// never reaches the code that sets `Feature_type`, `Gene`, `Feature`,
+    /// `BIOTYPE`, `STRAND`, `FLAGS` or `DISTANCE`
+    /// (`OutputFactory::IntergenicVariationAllele_to_output_hash`). The writers
+    /// have to ask, because the row's own fields hold `-` and a strand.
+    pub fn is_featureless(&self) -> bool {
+        &*self.transcript_id == Self::NO_FEATURE
+    }
+}
+
 /// Annotation for a specific allele against a specific transcript.
 #[derive(Debug, Clone)]
 pub struct AlleleAnnotation {
     pub allele: Allele,
     pub consequences: Vec<Consequence>,
     pub impact: Impact,
-    pub cdna_position: Option<(u64, u64)>,
-    pub cds_position: Option<(u64, u64)>,
+    /// The `cDNA_position`, `CDS_position`, `Protein_position`, `EXON` and `INTRON`
+    /// cells as Ensembl VEP writes them: `?-7` for a change that begins outside an
+    /// exon, `601-602` for an insertion, `2-3/10` for a change over two exons.
+    pub location: TranscriptLocation,
+    /// The residue span, as the ACMG criteria read it. It is not what the writers
+    /// print; that is `location.protein`.
     pub protein_position: Option<(u64, u64)>,
     pub amino_acids: Option<(String, String)>,
     pub codons: Option<(String, String)>,
+    /// The exon the change starts in, as `(rank, total)`, for the ACMG last-exon
+    /// test. The `EXON` cell is `location.exon`.
     pub exon: Option<(u32, u32)>,
-    pub intron: Option<(u32, u32)>,
-    /// Signed distance in bp from the nearest exon boundary: `+N` on the donor
-    /// side, `-N` on the acceptor side, `None` for a change that reaches no
-    /// intronic base.
+    /// Where this allele sits against the transcript's exons and introns, for
+    /// the ACMG criteria and for nothing else.
     ///
-    /// Read off the transcript, not off the HGVSc. The two used to be the same
-    /// number and are not: `c.` is a *display* form, 3'-shifted, so a deletion
-    /// of an acceptor's own `G` is written `c.1686-1del` where the shift has
-    /// nowhere to go and `c.1686del` where the first exonic base repeats it -
-    /// the same variant, one spelling of it carrying no offset at all.
-    ///
-    /// Populated only when the run is going to classify, the way `hgvsc` is
-    /// populated only under `--hgvs`: the ACMG criteria are its only reader and
-    /// finding it walks the transcript's introns per allele.
-    pub intron_offset: Option<i64>,
-    /// The same distance at the most 3' position HGVS gives the change, which on
-    /// a donor is the furthest into the intron it can be written.
-    ///
-    /// PVS1's canonical-splice gate is the only reader: an offset past `+2`
-    /// there proves some alignment of the change leaves `+1` and `+2` alone, so
-    /// the dinucleotide PVS1's splice track assumes is destroyed is intact. See
-    /// `fastvep_annotate::shifted_intronic_offset`.
-    ///
-    /// Populated only for a variant carrying a canonical splice term, which is
-    /// the only case that gate looks at, because finding it walks the reference.
-    pub shifted_intron_offset: Option<i64>,
+    /// Filled in by the classification pass, for the rows `--pick` kept, the way
+    /// `hgvsc` is filled in only under `--hgvs`: finding it walks the
+    /// transcript's exons and, for an indel, the reference. It is stored here and
+    /// not recomputed because the compound-heterozygote pass classifies a row a
+    /// second time, long after the transcript models are out of reach.
+    pub splice: SpliceContext,
     pub distance: Option<i64>,
     /// Full-length peptide of the transcript, in residues. `None` for
     /// non-coding transcripts.
@@ -133,6 +154,17 @@ pub struct AlleleAnnotation {
     pub supplementary: Vec<(String, String)>,
     /// ACMG-AMP classification result (serialized as serde_json::Value).
     pub acmg_classification: Option<serde_json::Value>,
+    /// Whether `--flag-pick*` chose this (transcript, allele) pair.
+    ///
+    /// The flag sits on the allele rather than on the `TranscriptVariation`
+    /// because that is the granularity the output has: every format emits one
+    /// entry per (transcript x allele), so a transcript picked for one alt of
+    /// a multi-allelic site and not for another has to say so per alt or say
+    /// something false about one of them.
+    ///
+    /// Always `false` under `--pick*`, which deletes the losers instead of
+    /// marking the winner, and under a plain run, which picks nothing.
+    pub pick: bool,
     /// ClinGen/CGC/VICC somatic oncogenicity result (serialized as
     /// serde_json::Value), set under `--somatic`.
     pub oncogenicity_classification: Option<serde_json::Value>,

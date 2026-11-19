@@ -92,6 +92,11 @@ impl FastaReader {
                 .ok_or_else(|| not_found_error(chrom, "FASTA"))?,
         };
 
+        // An insertion's span is `start..start - 1`: no bases, which is not an error and not a
+        // slice that runs backwards.
+        if end < start {
+            return Ok(&[]);
+        }
         let start_idx = (start.saturating_sub(1)) as usize;
         let end_idx = (end as usize).min(seq.len());
 
@@ -115,10 +120,45 @@ impl FastaReader {
 
     /// Get the length of a chromosome (with chr↔bare / mito alias fallback).
     pub fn sequence_length(&self, chrom: &str) -> Option<u64> {
+        // The exact name first, as `fetch_slice` does: the aliases are a `Vec` of `String`s, made for
+        // every fetch of a run
+        if let Some(seq) = self.sequences.get(chrom) {
+            return Some(seq.len() as u64);
+        }
         chrom_aliases(chrom)
             .iter()
             .find_map(|alias| self.sequences.get(alias))
             .map(|s| s.len() as u64)
+    }
+}
+
+/// A reference FASTA opened the way its compression allows.
+///
+/// A `.fai` addresses bytes in the uncompressed file. A gzipped FASTA is
+/// loaded whole instead, and `ignored_fai` says a neighbouring index was
+/// left unused for that reason.
+pub enum ReferenceFasta {
+    Mapped(MmapFastaReader),
+    Loaded {
+        reader: FastaReader,
+        ignored_fai: bool,
+    },
+}
+
+impl ReferenceFasta {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let fai_path = format!("{}.fai", path.display());
+        let fai_exists = std::path::Path::new(&fai_path).exists();
+        let gzip = crate::gzip::is_gzip_compressed(path)?;
+        if fai_exists && !gzip {
+            return Ok(Self::Mapped(MmapFastaReader::open(path)?));
+        }
+        let reader = crate::gzip::open_maybe_gzip(path)
+            .with_context(|| format!("Opening FASTA: {}", path.display()))?;
+        Ok(Self::Loaded {
+            reader: FastaReader::from_reader(reader)?,
+            ignored_fai: fai_exists && gzip,
+        })
     }
 }
 
@@ -174,6 +214,13 @@ impl MmapFastaReader {
     pub fn fetch(&self, chrom: &str, start: u64, end: u64) -> Result<Vec<u8>> {
         let entry = self.get_entry(chrom)?;
 
+        // An insertion's span is `start..start - 1`: no bases. Without this the length below was
+        // `end - start + 1` with an `end` before the `start`, which is a subtraction that
+        // overflows (a panic with `--distance 0` for an insertion, in a build that checks, and
+        // a length of nothing by luck in one that wraps).
+        if end < start {
+            return Ok(Vec::new());
+        }
         let start_0 = start.saturating_sub(1);
         let end_0 = end.min(entry.length).saturating_sub(1);
 
@@ -327,6 +374,40 @@ mod tests {
         assert_eq!(reader.sequence_length("chr1"), Some(16));
     }
 
+    /// An insertion's span is `start..start - 1`, and has no bases. Both readers say so, and neither
+    /// panics or reads a base that is not there (`--distance 0` asked for it with every insertion).
+    #[test]
+    fn a_span_that_ends_before_it_starts_has_no_bases() {
+        let fasta = ">chr1\nACGTACGT\nAAAACCCC\n";
+        let reader = FastaReader::from_reader(fasta.as_bytes()).unwrap();
+        for (start, end) in [(5, 4), (1, 0), (16, 15), (9, 8)] {
+            assert_eq!(
+                reader.fetch("chr1", start, end).unwrap(),
+                b"",
+                "{start}..{end}"
+            );
+        }
+        assert!(
+            reader.fetch("chr99", 5, 4).is_err(),
+            "a missing contig is still an error"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("g.fa");
+        std::fs::write(&path, fasta).unwrap();
+        std::fs::write(dir.path().join("g.fa.fai"), "chr1\t16\t6\t8\t9\n").unwrap();
+        let mapped = MmapFastaReader::open(&path).unwrap();
+        for (start, end) in [(5, 4), (1, 0), (16, 15), (9, 8)] {
+            assert_eq!(
+                mapped.fetch("chr1", start, end).unwrap(),
+                b"",
+                "{start}..{end}"
+            );
+        }
+        assert_eq!(mapped.fetch("chr1", 5, 8).unwrap(), b"ACGT");
+        assert!(mapped.fetch("chr99", 5, 4).is_err());
+    }
+
     #[test]
     fn test_fasta_reader_missing_chrom() {
         let fasta = ">chr1\nACGT\n";
@@ -391,5 +472,32 @@ mod tests {
         let mut cursor = Cursor::new(fasta.as_bytes().to_vec());
         let seq = fetch_with_index(&mut cursor, &fai_entries, "chr1", 1, 4).unwrap();
         assert_eq!(seq, b"ACGT");
+    }
+
+    #[test]
+    fn gzipped_fasta_loads_even_when_the_name_hides_it_and_a_fai_is_ignored() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ref.fa");
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b">chr1\nACGTACGT\n").unwrap();
+        std::fs::write(&path, enc.finish().unwrap()).unwrap();
+        // Offsets in this index do not address the gzip member. Using it
+        // would return compressed bytes.
+        std::fs::write(dir.path().join("ref.fa.fai"), "chr1\t8\t6\t8\t9\n").unwrap();
+
+        match ReferenceFasta::open(&path).unwrap() {
+            ReferenceFasta::Loaded {
+                reader,
+                ignored_fai,
+            } => {
+                assert!(ignored_fai);
+                assert_eq!(reader.fetch("chr1", 1, 4).unwrap(), b"ACGT");
+            }
+            ReferenceFasta::Mapped(_) => panic!("a gzipped FASTA must not be memory-mapped"),
+        }
     }
 }

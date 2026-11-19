@@ -25,7 +25,7 @@ The hosted instance is for interactive use in the browser. For programmatic acce
 - **ACMG-AMP Classification** — `--acmg` runs the full Richards 2015 + ClinGen SVI rule set (28 criteria, configurable thresholds, trio / compound-het support via `--proband`/`--mother`/`--father`)
 - **VEP `--merged` Cache** — `--gff3` is repeatable on `annotate` and `cache`; combine Ensembl + RefSeq in a single run with per-transcript SOURCE labels
 - **`--sa-only` Mode** — Skip the default CSQ pipeline and emit only supplementary annotations, useful for re-annotating already-annotated VCFs
-- **Gzipped VCF Input** — `annotate` auto-detects `.vcf.gz` / `.vcf.bgz` (no upstream decompression needed)
+- **Gzipped inputs** — `annotate` auto-detects gzip-compressed VCF, GFF3, and FASTA by magic bytes, with a `.gz` / `.bgz` filename fallback. A `.gff3.gz` that has a `.tbi` is still read through tabix. A `.fai` applies only to an uncompressed FASTA, because its offsets address that file; a gzipped FASTA is loaded into memory
 - **Web Interface** — Built-in web GUI for interactive variant annotation
 - **GFF3 Annotation Support** — Load gene models from standard GFF3 files (any organism)
 
@@ -37,6 +37,8 @@ The hosted instance is for interactive use in the browser. For programmatic acce
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
+
+Building also needs a C compiler, since the `zstd` and `mimalloc` crates compile C: the command line tools of Xcode on macOS (`xcode-select --install`), `build-essential` on Debian and Ubuntu.
 
 ### 2. Build and install fastVEP
 
@@ -56,6 +58,31 @@ fastvep --version
 > ```bash
 > source "$HOME/.cargo/env"
 > ```
+
+#### Alternative: download a prebuilt binary
+
+Each [release](https://github.com/Huang-lab/fastVEP/releases) carries `fastvep` and `fastvep-web` in one archive per platform, with a `.sha256` file beside it:
+
+| Platform | Archive |
+| --- | --- |
+| Linux, x86_64 | `fastVEP-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, aarch64 (releases after v0.4.0) | `fastVEP-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS, Apple silicon | `fastVEP-<version>-aarch64-apple-darwin.tar.gz` |
+
+```bash
+VERSION=v0.4.0                    # a release tag
+TARGET=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu, aarch64-apple-darwin
+BASE=https://github.com/Huang-lab/fastVEP/releases/download/$VERSION
+curl -LO "$BASE/fastVEP-$VERSION-$TARGET.tar.gz"
+curl -LO "$BASE/fastVEP-$VERSION-$TARGET.tar.gz.sha256"
+sha256sum -c "fastVEP-$VERSION-$TARGET.tar.gz.sha256"   # shasum -a 256 -c on macOS
+tar -xzf "fastVEP-$VERSION-$TARGET.tar.gz"
+"fastVEP-$VERSION-$TARGET/fastvep" --version
+```
+
+The Linux binaries need glibc 2.34 or newer: Ubuntu 22.04, Debian 12, RHEL 9 and its rebuilds (Rocky Linux, AlmaLinux), and anything newer.
+The release workflow runs each Linux archive in Rocky Linux 9 before it publishes it, so that a build which asks for a newer glibc stops the release.
+On an older system (Ubuntu 20.04, Debian 11, RHEL 8), build from source as above.
 
 #### Alternative: build a conda package
 
@@ -185,11 +212,12 @@ This section walks through setting up fastVEP with full annotation capabilities 
 mkdir -p data && cd data
 
 # Gene models (GFF3) — pick your organism
-# Human GRCh38
+# Human GRCh38. `annotate` reads the `.gz` directly; gunzip is optional.
 wget https://ftp.ensembl.org/pub/release-115/gff3/homo_sapiens/Homo_sapiens.GRCh38.115.gff3.gz
-gunzip Homo_sapiens.GRCh38.115.gff3.gz
 
-# Reference FASTA (needed for HGVS and sequence context)
+# Reference FASTA (needed for HGVS and sequence context).
+# `annotate` reads `.fa.gz` directly, into memory. For a whole genome,
+# gunzip and index it so the run memory-maps the file instead.
 wget https://ftp.ensembl.org/pub/release-115/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
 gunzip Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
 
@@ -198,6 +226,9 @@ samtools faidx Homo_sapiens.GRCh38.dna.primary_assembly.fa
 ```
 
 ### Step 2: Build supplementary annotation databases
+
+For every source, for both GRCh38 and GRCh37, with download URLs, sizes, which ones need an account, and a script that does the downloading and building, see [docs/SA_DATABASES.md](docs/SA_DATABASES.md).
+The quickest way to try supplementary annotation is `scripts/build-sa-databases.sh --assembly GRCh38`, which builds the small open sources in a few minutes.
 
 Each supplementary database (ClinVar, gnomAD, etc.) is built in **two steps** — *download the source file*, then run `fastvep sa-build` to convert it into a fastSA database (a `.osa2` file by default; a `.osa` + `.osa.idx` pair under `--format osa`). **`sa-build` is a converter, not a downloader; if you skip the download, the resulting database will be empty and your annotations will silently come back blank.** After each build, check that the file size matches the expected magnitude (column below); a few-KB database is the tell that the source file wasn't real.
 
@@ -214,7 +245,9 @@ fastvep sa-build --source clinvar -i clinvar.vcf.gz -o sa_databases/clinvar --as
 # Per-chromosome sites VCFs. Measured 2026-08-31, chr1-22 X Y: the exomes
 # release is 198 GB and the genomes release is 563 GB, so most setups want
 # tabix-extracted target regions rather than the whole thing. See
-# docs/ACMG_SETUP.md for the region-restricted recipe.
+# docs/ACMG_SETUP.md for the region-restricted recipe, and for the joint release
+# of the exomes and the genomes, which gives more calls in direction on the
+# ACMG benchmark than the exomes alone.
 GNOMAD=https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/exomes
 wget "$GNOMAD/gnomad.exomes.v4.1.sites.chr1.vcf.bgz"
 fastvep sa-build --source gnomad -i gnomad.exomes.v4.1.sites.chr1.vcf.bgz -o sa_databases/gnomad_chr1 --assembly GRCh38
@@ -348,9 +381,9 @@ fastvep annotate -i variants.vcf \
   --fasta GRCh38.fa
 ```
 
-Each transcript carries its source through to all output formats:
-`SOURCE` field in the VCF CSQ string, the `source` key in JSON, and the
-SOURCE column in tab output (with `--canonical` / extended fields).
+Each transcript carries its source through to the VCF and JSON output:
+the `SOURCE` field in the VCF CSQ string and the `source` key in JSON.
+(Tab output has no `SOURCE` column.)
 Transcripts from both sources are queried independently — overlap
 detection, HGVS, and supplementary annotation all run per-transcript,
 so RefSeq NM_… and Ensembl ENST… records appear as separate CSQ entries
@@ -417,7 +450,7 @@ fastVEP supports direct integration with clinical and population databases throu
 | **PrimateAI** | Allele-specific | Primate-based pathogenicity | `--source primateai` |
 | **dbNSFP** | Allele-specific | SIFT/PolyPhen predictions | `--source dbnsfp` |
 | **AlphaMissense** | Allele-specific | Missense pathogenicity score + class | `--source alphamissense` |
-| **OMIM / ClinGen GDV** | Gene-level (`.oga`) | Disease-gene annotations driving PVS1, BS2, PM3, BP2 in ACMG | `--source omim` |
+| **OMIM / ClinGen GDV** | Gene-level (`.oga`) | Disease-gene validity and mode of inheritance, driving PVS1, PP2, PM1 (validity) and PM2, BS2, PM3, BP2 (inheritance) in ACMG | `--source omim` |
 | **gnomAD constraint** | Gene-level (`.oga`) | gnomAD constraint metrics (pLI, LOEUF) for PVS1, PP2, BP1 | `--source gnomad_genes` |
 | **ClinVar protein index** | Gene-level (`.oga`) | Pathogenic missense by protein position (PS1, PM1, PM5) | `--source clinvar_protein` |
 | **Custom VCF** | Allele-specific (`.osa`) | Any user-supplied VCF, INFO fields become the JSON object | `--source custom_vcf` |
@@ -490,19 +523,43 @@ for the parsing rules and the escaping table.
 | `--gff3` | GFF3 gene annotation file. May be repeated to replicate VEP's `--merged` cache (Ensembl + RefSeq in a single run); each value may be `LABEL=path` to control the SOURCE column. | -- |
 | `--fasta` | Reference FASTA file | -- |
 | `--output-format` | `vcf`, `tab`, or `json` | `vcf` |
-| `--hgvs` | Include HGVS notations | off |
-| `--pick` | Report one consequence per variant, chosen by `--pick-order` | off |
+| `--hgvs` | Add `HGVSc`, `HGVSp` and `HGVS_OFFSET`: as columns in tab output, as values in the VCF and JSON output. VEP's `--hgvs` | off |
+| `--hgvsg` | Add `HGVSg` (`chr10:g.10414C>A`) to tab and VCF output, and the `hgvsg` key of JSON. VEP's `--hgvsg`: an insertion or deletion is written at its most 3' position along the genome and an insertion that repeats its neighbours is a `dup`, which reads the reference, so give `--fasta`. See [docs/VEP_DIVERGENCE.md](docs/VEP_DIVERGENCE.md#11-an-allele-of-a-record-with-several-alts-is-described-as-it-would-be-alone) | off |
+| `--pick` | Report one consequence per variant, chosen by `--pick-order`, keeping that transcript's annotation for every alt allele | off |
+| `--pick-allele` | One consequence per (variant, allele). VEP's `--pick_allele` | off |
+| `--pick-allele-gene` | One consequence per (variant, allele, gene). VEP's `--pick_allele_gene` | off |
+| `--flag-pick` | Report *every* consequence and mark the one `--pick` would have kept with `PICK=1`. VEP's `--flag_pick` | off |
+| `--flag-pick-allele` | As `--flag-pick`, marking the pick per allele | off |
+| `--flag-pick-allele-gene` | As `--flag-pick`, marking the pick per allele and gene | off |
 | `--pick-order` | Criteria order used by `--pick`, VEP `--pick_order` syntax. Severity (`rank`) is last in the default, so this is not "most severe" -- see [docs/ACMG.md](docs/ACMG.md#which-transcript---pick-reports) | VEP's default |
-| `--symbol` | Include gene symbol in output | off |
-| `--canonical` | Include canonical-transcript flag in output | off |
-| `--everything` | Turn on all common annotation flags | off |
+| `--symbol` | Add `SYMBOL`, `SYMBOL_SOURCE` and `HGNC_ID` to tab output (the VCF `CSQ` always has them). VEP's `--symbol` | off |
+| `--canonical` | Add `CANONICAL` (`YES`) to tab output (the VCF `CSQ` always has it). VEP's `--canonical` | off |
+| `--biotype` | Add `BIOTYPE` to tab output (the VCF `CSQ` always has it). VEP's `--biotype` | off |
+| `--numbers` | Add `EXON` and `INTRON` (`3/10`) to tab output (the VCF `CSQ` always has them). VEP's `--numbers` | off |
+| `--variant-class` | Add `VARIANT_CLASS` (`SNV`, `insertion`, `deletion`, ...) to tab and VCF output. VEP's `--variant_class` | off |
+| `--show-ref-allele` | Add `REF_ALLELE` to tab output (the VCF `CSQ` always has it). VEP's `--show_ref_allele`. (`--explicit-alleles` puts `REF` right after `Allele` instead) | off |
+| `--total-length` | Write the length each position is counted in after `cDNA_position`, `CDS_position` and `Protein_position`, `14/203`, in tab and VCF output (JSON writes numbers). VEP's `--total_length` | off |
+| `--no-escape` | Do not percent-escape HGVS strings: a synonymous `HGVSp` ends in `=` and not `%3D`, and the space of a gene symbol in the VCF `CSQ` is `_` and not `%20`. VEP's `--no_escape` | off |
+| `--force-overwrite` | Accepted so that a `vep` command line is not refused, and does nothing: `fastvep annotate` always writes over its output file, which is what VEP's `--force_overwrite` asks for | -- |
+| `--exclude-predicted` | Leave out RefSeq's predicted transcripts, `XM_` and `XR_`. VEP's `--exclude_predicted`, which is `not stable_id match ^X._`, and so is this. A variant left with no transcript is an `intergenic_variant` | off |
+| `--exclude-readthrough` | Leave out the transcripts the annotation tags `readthrough_transcript`, which span two genes. VEP's Ensembl cache is built without them and a GFF3 has them, so give it to match `vep --cache` | off |
+| `--exclude-artifact` | Leave out transcripts of biotype `artifact`. VEP's Ensembl cache is built without them and a GFF3 has them, so give it to match `vep --cache` | off |
+| `--af` | Add `AF`, the 1000 Genomes combined allele frequency of the known variant, to the tab output and the CSQ. VEP's `--af`. Written as VEP writes it: per input allele, to four decimals, with the other allele of a two-allele record taken as `1 - AF`. Reads the variation cache, so it needs `--cache-dir`, as do the six flags below | off |
+| `--af-1kg` | Add `AF`, `AFR_AF`, `AMR_AF`, `EAS_AF`, `EUR_AF` and `SAS_AF`. VEP's `--af_1kg` | off |
+| `--af-gnomade` | Add `gnomADe_AF` and the gnomAD exomes populations (`gnomADe_AFR_AF` ... `gnomADe_SAS_AF`). VEP's `--af_gnomade`; its old name `--af-gnomad` is accepted | off |
+| `--af-gnomadg` | Add `gnomADg_AF` and the gnomAD genomes populations (`gnomADg_AFR_AF` ... `gnomADg_SAS_AF`). VEP's `--af_gnomadg` | off |
+| `--max-af` | Add `MAX_AF`, the highest frequency of any 1000 Genomes or gnomAD population (the combined ones are left out), and `MAX_AF_POPS`, the populations that have it. VEP's `--max_af` | off |
+| `--check-existing` | Add `CLIN_SIG`, `SOMATIC` and `PHENO` from the known variants, to the tab output and the CSQ, as VEP's `--check_existing` does. Every frequency flag and `--pubmed` imply it, and so does `--cache-dir`, which has no other use here, so the flag is only needed to be typed as VEP has it. `Existing_variation` is filled whenever `--cache-dir` is given | on with `--cache-dir` |
+| `--pubmed` | Add `PUBMED`, the publications that cite the known variants, to the tab output and the CSQ. VEP's `--pubmed` | off |
+| `--clin-sig-allele` | `1`: `CLIN_SIG` is what a known variant says about the input allele, where it says it; `0`: what it says about the variant. VEP's `--clin_sig_allele` | `1` |
+| `--everything` | Turn on `--hgvs --symbol --numbers --canonical --biotype --variant-class`: VEP's `--everything`, restricted to the columns fastVEP writes (not `--hgvsg` or `--show-ref-allele`, which VEP's does not include either). With `--cache-dir` it also turns on `--af --af-1kg --af-gnomade --af-gnomadg --max-af --pubmed`, as VEP's does | off |
 | `--distance` | Upstream/downstream distance in bp | `5000` |
-| `--buffer-size` | Variants buffered per parallel batch | `5000` |
+| `--buffer-size` | Accepted for VEP compatibility and ignored: records are annotated in batches of 1,024 | ignored |
 | `--sa-dir` | Directory containing `.osa` / `.osa2` / `.osi` / `.oga` supplementary annotations | -- |
 | `--sa-only` | Skip the default CSQ annotation and emit only supplementary annotations from `--sa-dir` (requires `--sa-dir`) | off |
-| `--cache-dir` | Path to VEP cache directory for known-variant lookup | -- |
+| `--cache-dir` | VEP's tabix variation cache, for `Existing_variation`: a directory of `{chr}/all_vars.gz` files, each with a `.csi` or `.tbi` index (what `convert_cache.pl` and the indexed-cache download provide). Only known variants come from it: gene models come from `--gff3`, and VEP's `{start}-{end}.gz` transcript slices are never read. Naming a cache is VEP's `--check_existing`: `Existing_variation`, `CLIN_SIG`, `SOMATIC` and `PHENO`; the frequencies and the PubMed ids need `--af*`, `--max-af` and `--pubmed`, as in VEP. Matching follows VEP's (anchored and minimal indels match, as in `--check_existing`). A directory with no variation file, or a file with no index, stops the run. Contigs are matched through a `chr_synonyms.txt` in the directory and the `chr`/`MT` naming rules | -- |
 | `--transcript-cache` | Path to binary transcript cache file (overrides the auto-managed `<gff3>.fastvep.cache` sidecar) | -- |
-| `--acmg` | Run ACMG-AMP classification (Richards 2015 + ClinGen SVI); adds `ACMG` + `ACMG_CRITERIA` to CSQ | off |
+| `--acmg` | Run ACMG-AMP classification (Richards 2015 + ClinGen SVI); adds `ACMG` + `ACMG_CRITERIA` to CSQ, and a last `ACMG_DISORDERS` column with the call against each mode of inheritance of a gene that has more than one | off |
 | `--acmg-config` | TOML file with custom ACMG thresholds | built-in defaults |
 | `--proband` / `--mother` / `--father` | Sample names for trio analysis — enables PS2 (de novo), PM6, BP2 | -- |
 | `--gene-list` | Path to a gene-panel file (one symbol or Ensembl gene ID per line). Tab output drops rows whose transcript isn't on the panel. | -- |
@@ -573,6 +630,13 @@ Pre-builds a binary transcript cache for fast startup. Accepts the same
 multi-`--gff3` / `LABEL=path` syntax as `annotate`, so a merged Ensembl
 + RefSeq cache can be built once and reused via `--transcript-cache`.
 
+The cache is a sequence of zstd frames of about 8 MB, each with a checksum, and a table of them at
+the end. A run with more than two threads decodes the frames side by side; a cache of one frame,
+which earlier builds wrote and which has no table, is read as a stream, as is every cache by a run
+of one or two threads (which does not look at the table). A cache that fails a checksum, that does
+not end where its list does, or whose table does not describe it, is rebuilt from the GFF3 when it
+is the auto-managed sidecar, and stops the run when it is named with `--transcript-cache`.
+
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--gff3` | GFF3 annotation file(s). Repeatable; each value may be `LABEL=path`. | *required* |
@@ -584,13 +648,50 @@ multi-`--gff3` / `LABEL=path` syntax as `annotate`, so a merged Ensembl
 
 ### VCF Output
 
-Consequence annotations are added as a `CSQ` field in the INFO column with 49 pipe-delimited fields matching Ensembl VEP's extended format, plus fastVEP-specific `ACMG` and `ACMG_CRITERIA` slots when `--acmg` is set. When supplementary annotation databases are loaded with `--sa-dir`, fastVEP also emits VCF-compatible INFO projections for supported fastSA sources: standard `SpliceAI` for SpliceAI databases, and fastVEP-specific `FV_*` fields such as `FV_CLINVAR`, `FV_GNOMAD`, `FV_DBSNP`, `FV_REVEL`, and gene-level `FV_OMIM`.
+Consequence annotations are added as a `CSQ` field in the INFO column with 49 pipe-delimited fields matching Ensembl VEP's extended format, plus fastVEP-specific `ACMG` and `ACMG_CRITERIA` slots when `--acmg` is set (a run with `--acmg` also ends with an `ACMG_DISORDERS` field, empty unless the gene has more than one mode of inheritance; see [docs/ACMG.md](docs/ACMG.md#genes-with-more-than-one-mode-of-inheritance)). When supplementary annotation databases are loaded with `--sa-dir`, fastVEP also emits VCF-compatible INFO projections for supported fastSA sources: standard `SpliceAI` for SpliceAI databases, and fastVEP-specific `FV_*` fields such as `FV_CLINVAR`, `FV_GNOMAD`, `FV_DBSNP`, `FV_REVEL`, and gene-level `FV_OMIM`.
 
 The VCF output never embeds raw JSON in INFO values. Use `--output-format json` for the richest structured representation of all supplementary annotation objects.
 
 ### Tab Output
 
-One line per variant-transcript-allele combination with 17 columns.
+One line per variant, transcript and allele.
+The 17 columns are VEP's 13 base columns (`Uploaded_variation`, `Location`, `Allele`, `Gene`, `Feature`, `Feature_type`, `Consequence`, `cDNA_position`, `CDS_position`, `Protein_position`, `Amino_acids`, `Codons`, `Existing_variation`) and `IMPACT`, `DISTANCE`, `STRAND`, `FLAGS`.
+Around them go `REF` (with `--explicit-alleles`, right after `Allele`), `PICK` (with `--flag-pick*`, right after `FLAGS`, as in VEP), one column per loaded supplementary source and `QC_CLASS` (with `--qc-rules`), the last two at the end.
+
+The cells follow VEP's tab writer:
+
+- A value a row does not have is `-`, never an empty cell.
+- `Location` runs from the lower coordinate to the higher, so an insertion, which sits between two bases, is `chr10:11950-11951`.
+- `Uploaded_variation` is the VCF ID (the first, if there are several), or the line itself, `{CHROM}_{POS}_{REF}/{ALT}`, when the record has none: `chr10_10414_C/A`, `chr10_10400_AACCCT/A`, and `chr10_109_CA/C/TA` for a record with two alts.
+  It is not built from the minimal alleles of the annotation, as it was.
+- `Amino_acids` is `L/P`, or just `L` when the protein does not change, as in the VCF `CSQ` and in JSON.
+- A record with one ALT that is an indel is minimised from both ends before it is annotated, as VEP does: `CAGT>CT` is the deletion of `AG` and its `Allele` is `-`, whatever the caller left in.
+- An ALT of `*` (a spanning deletion) or one of the placeholders a gVCF carries (`.`, `<NON_REF>`, `<*>`) gets no row, and a record with none but those has none; the real ALTs beside one are annotated as they would be alone.
+  An ALT or REF that holds an ambiguity code (`N`) cannot be translated: in the coding sequence it is `coding_sequence_variant` (or `frameshift_variant` when its length moves the frame), with no `Amino_acids`, `HGVSp` or `HGVSc`, as in VEP.
+- `cDNA_position`, `CDS_position` and `Protein_position` are the positions of the first and the last base of the change in transcript order, and an end that is not in an exon (for the cDNA) or not in the coding sequence (for the CDS and the protein) has no coordinate: `?-7` for a deletion that starts in an intron or upstream of the transcript, `601-?` for one that runs out of the exon.
+  An insertion has the two positions it sits between (`601-602`), also when one of them is across an exon boundary, and no CDS or protein position when it sits just before the initiator or just after the terminator.
+  `EXON` and `INTRON` list every exon and intron the change overlaps, `2-3/10` for a change over two, and an insertion at an exon's edge overlaps neither.
+  The same cells are written to the VCF `CSQ`, and JSON has `cdna_start` and `cdna_end` (and the CDS and protein pairs) for the ends that have one.
+  With `--total-length` each cell is followed by the length it is counted in, as in VEP: `451-?/1403`, `51/654`, `17/217` (the cDNA, the coding sequence with its stop codon, the protein without it).
+  The cDNA length goes on every row whose change touches an exon, and the other two on the rows that touch the coding sequence too, whatever the cell holds, so a deletion that covers an exon from intron to intron is `-/1403`, `-/654` and `-/217`.
+- A variant with no overlapping transcript has no feature, so `Gene`, `Feature`, `Feature_type`, `DISTANCE`, `STRAND` and `FLAGS` are `-`; `IMPACT` is still `MODIFIER`.
+  A VCF `CSQ` entry for it leaves those fields empty.
+
+VEP adds further tab columns only when asked, and so does fastVEP, with VEP's flag names (spelled with hyphens here): `--show-ref-allele`, `--variant-class`, `--symbol`, `--biotype`, `--canonical`, `--numbers`, `--hgvs`, `--hgvsg` and the known-variant flags below.
+They are written in the order VEP's own table gives them: `REF_ALLELE` between `Existing_variation` and `IMPACT`, then, after `FLAGS` (and `PICK`), `VARIANT_CLASS`, `SYMBOL`, `SYMBOL_SOURCE`, `HGNC_ID`, `BIOTYPE`, `CANONICAL`, `EXON`, `INTRON`, `HGVSc`, `HGVSp`, `HGVS_OFFSET` and `HGVSg`, and before any supplementary-source column.
+A flag you do not give adds nothing, so a run without any of them has the 17 columns above.
+`FLAGS` holds the transcript's flags (`cds_start_NF`), as in VEP, and `CANONICAL` says whether the transcript is canonical.
+`HGVSp` writes `=` as `%3D`, as VEP does in its tab file and in its VCF (`--no-escape` leaves it an `=`), and `HGVS_OFFSET` is how far the HGVS description moved 3' from where the VCF had the variant, signed by the strand.
+The underscore spellings VEP uses for those three flags (`--total_length`, `--no_escape`, `--force_overwrite`) are accepted beside the hyphenated ones.
+
+The columns of the known variants (`--af`, `--af-1kg`, `--af-gnomade`, `--af-gnomadg`, `--max-af`, `--check-existing`, `--pubmed`) read the variation cache of `--cache-dir` and are worked out as VEP works them out, for each input allele and from every known variant of the site.
+They come after `HGVSg`, in VEP's order: `AF` and the 1000 Genomes populations, the gnomAD exomes and genomes populations, `MAX_AF`, `MAX_AF_POPS`, `CLIN_SIG`, `SOMATIC`, `PHENO`, `PUBMED`.
+A flag that reads the cache without one is an error rather than a column of `-`.
+The VCF `CSQ` keeps `AF`, `CLIN_SIG`, `SOMATIC`, `PHENO` and `PUBMED` among its 49 default fields, so that a reader that finds a field by its position keeps finding it, and the columns of the other flags follow `AF`.
+They hold VEP's per-allele value or nothing: `CLIN_SIG`, `SOMATIC` and `PHENO` whenever there is a `--cache-dir`, `AF` under `--af` or `--af-1kg`, `PUBMED` under `--pubmed`.
+They used to hold a summary of the whole variant (the first frequency of any known variant of the site, gnomAD's where it had one, which is not VEP's `AF`), and for a record with several ALTs that put one allele's number on every allele's row.
+A reader of that `AF` now gives `--af-1kg` (VEP's `AF`) or `--af-gnomade`.
+How the two tools differ, and what was checked against VEP 116.3, is in [docs/VEP_DIVERGENCE.md](docs/VEP_DIVERGENCE.md).
 
 ### JSON Output
 
@@ -613,7 +714,8 @@ fastVEP predicts 49 consequence types organized by impact:
 crates/
   fastvep-core/         # Core types: Consequence (49 SO terms), VariantType, Allele, Impact
   fastvep-genome/       # Transcript, Exon, Gene, CodonTable, mitochondrial codon table
-  fastvep-cache/        # GFF3 parser, FASTA reader, annotation providers, regulatory regions
+  fastvep-cache/        # GFF3 parser, FASTA reader, annotation providers, regulatory regions,
+                       #   the binary transcript cache (zstd frames, decoded side by side)
   fastvep-consequence/  # Consequence prediction: small variants + SV predictor
   fastvep-hgvs/         # HGVS nomenclature generation (c., p., g.)
   fastvep-io/           # VCF parser (incl. SVs), output formatters, multi-sample parsing
@@ -633,13 +735,13 @@ crates/
                        # PrimateAI, dbNSFP, plus user-supplied custom_vcf / custom_bed.
   fastvep-annotate/     # Shared annotation pipeline (used by CLI batch and web server):
                        #   variant overlap, consequence prediction, HGVS, SA/gene SA
-                       #   provider loading
+                       #   provider loading, and the pick (the --pick criteria)
   fastvep-classification/ # ACMG-AMP variant classification engine (Richards 2015 +
                        #   ClinGen SVI). 28 criteria, trio/compound-het support,
                        #   configurable thresholds via TOML
-  fastvep-cli/          # CLI binary. `src/pipeline/` holds one module per
-                       #   subcommand: annotate, cache_build, sa_build, filter,
-                       #   custom, plus pick (the --pick criteria)
+  fastvep-cli/          # CLI binary (mimalloc is its allocator). `src/pipeline/`
+                       #   holds one module per subcommand: annotate, cache_build,
+                       #   sa_build, filter, custom
   fastvep-web/          # Production web server (axum/tokio): async, multi-connection,
                        #   genome switching, SA integration, rate limiting
 web/                   # Web GUI (HTML/CSS/JS, embedded in both server binaries)
@@ -657,46 +759,61 @@ cargo test -p fastvep-sa           # Supplementary annotation format tests
 
 ## Performance Benchmarks
 
-Benchmarked on Apple M-series (ARM64), release build with LTO. Median of 3 runs, full Ensembl annotations with FASTA and HGVS.
+fastVEP's numbers below were measured on 2026-11-06 on an Apple M4 (10 cores, ARM64, macOS), with the release build (LTO) of this repository at the commit that carries the performance changes of #166.
+Each is the median of 3 runs, with the full Ensembl annotations, the FASTA and HGVS.
+The Ensembl VEP times were measured on 2026-07-29 on the same machine and were not run again, so each speedup is the VEP time of that day over the fastVEP time of this one.
 
 ### Multi-Organism Throughput (Gold-Standard Datasets)
 
+Default threads, `--hgvs`, the output written to a file, the binary transcript cache already built.
+
 | Organism | Transcripts | Variants | Source | Time | Throughput |
 |----------|-------------|----------|--------|------|------------|
-| Yeast (R64, full genome) | 7,036 | 260,526 | Ensembl/SGD | 3.0s | **85,934 v/s** |
-| Drosophila (BDGP6, full) | 35,442 | 4,438,427 | DGRP2 | 57.3s | **77,486 v/s** |
-| Arabidopsis (TAIR10, full) | 54,013 | 12,883,854 | 1001 Genomes | 168.7s | **76,378 v/s** |
-| Mouse (GRCm39, full genome) | 142,626 | 26,062,054 | MGP CAST/EiJ | 338.0s | **77,113 v/s** |
-| Human full WGS (GRCh38) | 508,530 | 4,048,342 | GIAB HG002 | 86.3s | **46,917 v/s** |
+| Yeast (R64, full genome) | 7,036 | 260,526 | Ensembl/SGD | 0.5s | **485,965 v/s** |
+| Drosophila (BDGP6, full) | 35,442 | 4,438,427 | DGRP2 | 9.8s | **450,698 v/s** |
+| Arabidopsis (TAIR10, full) | 54,013 | 12,883,854 | 1001 Genomes | 28.3s | **455,192 v/s** |
+| Mouse (GRCm39, full genome) | 142,626 | 26,062,054 | MGP CAST/EiJ | 73.9s | **352,771 v/s** |
+| Human full WGS (GRCh38) | 508,530 | 4,048,342 | GIAB HG002 | 16.3s | **248,829 v/s** |
 
 ### vs. Ensembl VEP v115.1 (head-to-head, single-thread, GIAB HG002)
 
-Both tools single-threaded on identical GRCh38 Ensembl 115 GFF3 + FASTA with `--hgvs --symbol --canonical`. fastVEP uses its binary transcript cache; Ensembl VEP runs via Docker (`ensemblorg/ensembl-vep:release_115.1`) in `--gff` mode against a bgzip+tabix-indexed GFF3. VEP's full-genome time is measured per chromosome and summed — a single-process whole-genome run OOMs above ~2.7M variants at the 7.65 GiB Docker default, and the per-chromosome sum keeps VEP's memory bounded (its best case).
+Both tools single-threaded on identical GRCh38 Ensembl 115 GFF3 + FASTA with `--hgvs --symbol --canonical`.
+fastVEP uses its binary transcript cache; Ensembl VEP runs via Docker (`ensemblorg/ensembl-vep:release_115.1`) in `--gff` mode against a bgzip+tabix-indexed GFF3.
+VEP's full-genome time is measured per chromosome and summed: a single-process whole-genome run OOMs above ~2.7M variants at the 7.65 GiB Docker default, and the per-chromosome sum keeps VEP's memory bounded (its best case).
 
 **Full human WGS (4,048,342 variants), single-thread:**
 
 | Annotation | fastVEP | Ensembl VEP | Speedup |
 |-----------|---------|-------------|---------|
-| Consequence only | 197.8s | 4,621s (~77 min) | **23.4×** |
-| + ClinVar | 197.4s | 4,803s | **24.3×** |
-| + gnomAD + ClinVar | 218.5s | 4,905s | **22.4×** |
+| Consequence only | 44.7s | 4,621s (~77 min) | **103×** |
+| + ClinVar | 45.9s | 4,803s | **105×** |
+| + gnomAD + ClinVar | 54.1s | 4,905s | **91×** |
 
-With fastVEP's default multi-threading (10 cores), the same full WGS completes in **93s** (consequence-only) to **104.5s** (+gnomAD+ClinVar) on this system.
+With fastVEP's default multi-threading (10 cores), the same full WGS completes in **13.1s** (consequence-only) to **18.2s** (+gnomAD+ClinVar) on this system.
+A whole-genome run on all cores writes 10.6 GB and varies from run to run, between 13s and 18s in the runs behind this section (the multi-organism table above has 16.3s for the same genome with `--hgvs` alone).
 
-**chr22 scaling, single-thread** — fastVEP carries a fixed ~2.7s binary-cache load, so VEP (which tabix-fetches only overlapping GFF regions) is faster below ~1–2K variants; beyond that fastVEP's per-variant throughput dominates:
+**chr22 scaling, single-thread** — fastVEP reads its binary transcript cache of 509,650 transcripts on every run: a run of 200 variants takes about 0.9s on one thread and 0.4s on eight, nearly all of it reading the cache.
+VEP (which tabix-fetches only overlapping GFF regions) is therefore faster at 1,000 variants, and fastVEP from a few thousand on:
 
 | Variants | fastVEP | VEP | Speedup |
 |----------|---------|-----|---------|
-| 1,000 | 2.68s | 0.45s | 0.17× (VEP faster) |
-| 5,000 | 2.86s | 6.29s | 2.2× |
-| 10,000 | 3.25s | 13.41s | 4.1× |
-| 50,284 | 5.09s | 93.95s | **18.5×** |
+| 1,000 | 0.95s | 0.45s | 0.5× (VEP faster) |
+| 5,000 | 1.01s | 6.29s | 6.2× |
+| 10,000 | 1.12s | 13.41s | 12× |
+| 50,284 | 1.65s | 93.95s | **57×** |
 
 | Resource | Ensembl VEP | fastVEP |
 |----------|-------------|---------|
-| Peak memory (100K variants) | ~500 MB | **2.8 MB** |
-| Binary / install size | ~200 MB installed | **3.3 MB** |
-| Dependencies | Perl 5.22+, DBI, 10+ CPAN modules | **None** |
+| Peak memory (100K variants) | ~500 MB | **2.7 GB** (the whole gene model, with its sequences, is in memory) |
+| Binary / install size | ~200 MB installed | **5.8 MB** |
+| Dependencies | Perl 5.22+, DBI, 10+ CPAN modules | **None** at run time (a C compiler to build) |
+
+### Threads and memory
+
+fastVEP uses every core unless `RAYON_NUM_THREADS=N` says otherwise.
+The peak memory of a run is the gene model and not the VCF or the threads: 2,700 MB on one thread and 2,697 MB on eight for 100,000 variants against the human Ensembl GFF3 with sequences (macOS), and 1,171 MB and 1,194 MB with a cache built without a FASTA, which has no sequences (consequence only, no `--hgvs`).
+On Linux (arm64, glibc 2.39, in a container) a run of 200 variants peaks at 2,648 MB on 4 threads and 2,677 MB on 64, where the build before #166 peaked at 2,520 MB on either: the peak does not grow with the threads, and the `fastvep` binary's allocator (mimalloc) holds 4 to 9% more of it than glibc's does, and nothing more on macOS.
+Under an address-space limit (`ulimit -v`, the `h_vmem` of some schedulers) a run of 100,000 variants on 8 threads needs about 1.2 GiB more than before: it ran down to a limit between 7,000 and 7,200 MiB, against 5,800 to 6,000 MiB, and below that it stops with `Cannot allocate memory`.
 
 ### Supplementary annotation format (fastSA v2)
 
@@ -748,9 +865,15 @@ The right-hand column is a systematic 1-in-200 sample of the GIAB HG002 WGS call
 variants, **118,956 matched rows** - and every field that carries a clinical call agrees on all of
 them. The 23 `HGVSc` rows left are 11 where fastVEP names a change VEP declines to name and 12
 where VEP writes a malformed `*` coordinate: no row of any of the three datasets has both tools
-naming a `c.` change and naming it differently. `HGVSg`, which is not in the CSQ field set and is
-rated separately, agrees on 13,525 of 13,535 records (99.93%); the ten are Ensembl's genomic
-3'-rule, which fastVEP does not apply. See [docs/VEP_DIVERGENCE.md](docs/VEP_DIVERGENCE.md).
+naming a `c.` change and naming it differently. `HGVSg`, which is written only under `--hgvsg`, was
+measured separately against Ensembl VEP 116.3 on the same sample: 20,238 of 20,241 records have the
+same set of descriptions, and the three that differ are multi-allelic records in which Ensembl
+describes an allele by its untrimmed bases, which does not reproduce the variant. The tab
+output's other columns are measured the same way, 3,851 of 5,581,650 cells differing, 17 of them in `HGVSp` (a protein change
+that Ensembl writes none for, divergence 17), and so is
+a RefSeq GFF3 (chr21 and chr22 of GRCh38.p14), 135 of 81,510 cells, all of them the multi-allelic
+difference of divergence 11, in
+[Part 3 of docs/VEP_DIVERGENCE.md](docs/VEP_DIVERGENCE.md#part-3---the-tab-output-against-vep-1163).
 
 **HGVSp under in-frame indels.**
 Protein-level normalisation is additionally checked on 400 ClinVar in-frame deletions run through
@@ -765,14 +888,21 @@ Agreement is the evidence that the port is faithful, not the objective. The outp
 a clinician may act on, so where Ensembl is demonstrably wrong in a way that changes a call,
 fastVEP is right instead.
 
-There are nine such places, and one of them matters clinically: Ensembl reports a change that
-introduces a premature stop as `inframe_insertion,stop_retained_variant`, MODERATE. BRCA1
-`c.5030_5033dup` - ClinVar Pathogenic - is one of 52 such variants in the ClinVar 2-star+ set, 38
-of them Pathogenic or Likely pathogenic. fastVEP reports `stop_gained,frameshift_variant`, HIGH,
-so those 52 keep PVS1.
+Against release 115.1 there were eleven such places, and one of them mattered clinically.
+Ensembl reported a change that introduces a premature stop as `inframe_insertion,stop_retained_variant`, MODERATE.
+BRCA1 `c.5030_5033dup` - ClinVar Pathogenic - is one of 52 such variants in the ClinVar 2-star+ set, 38 of them Pathogenic or Likely pathogenic.
+fastVEP reported `stop_gained,frameshift_variant`, HIGH, so those 52 kept PVS1.
+Release 116 rewrote that clause, and Ensembl VEP 116.3 writes `stop_gained,frameshift_variant` for them too.
+Against 116.3 two of the eleven are gone, that one and the second (a start codon a deletion removes), which fastVEP now reads as VEP does.
+Four more (the count or the first residue of a frameshift or of an extension, 5 to 8) turned out not to be differences with VEP but with its `--gff` reader, which takes the 3' UTR of a reverse-strand transcript from the wrong place and which a VEP cache does not do.
+Two more were found in the protein notation, one in VEP's 3'-shifting of an insertion on the reverse strand and one in how it reads an unresolved residue (12 and 13).
+Release 116.3 itself turned up six more, found by reading the start codon, the UTR, the introns and the VCF the way a clinician's pipeline meets them: a start codon is not lost where the protein still begins with its Met or where the whole coding sequence is behind the edit (14), a change that loses the initiator is `p.Met1?` whatever Ensembl writes (15), a row that is only a UTR variant has no protein change (16), a change that the 3'-rule carries over an intron is described as the change it is in the transcript (17), a record the run cannot place is said so and a REF that is not the genome's is described against the genome (18), and an insertion in front of residue 1 has no `HGVSp` (19).
 
 Every divergence, its cause in the Ensembl source, its row count, and the list of fastVEP's own
 remaining gaps in the other direction are in **[docs/VEP_DIVERGENCE.md](docs/VEP_DIVERGENCE.md)**.
+
+Moving a pipeline from `vep`? What fastVEP reads from a VEP installation, a flag-by-flag table, and what is
+not covered (plugins, `--custom`, RefSeq BAM edits) are in **[docs/VEP_MIGRATION.md](docs/VEP_MIGRATION.md)**.
 
 ## Citation
 

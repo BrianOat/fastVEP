@@ -4,22 +4,22 @@ use super::cache_build::{load_one_gff3, parse_gff3_arg, Gff3Spec};
 use super::open_vcf_input_reader;
 use anyhow::{Context, Result};
 use fastvep_annotate::pick::{
-    has_transcripts_to_pick, parse_pick_order, pick_best_transcript_idx_with, PickCriterion,
-    DEFAULT_PICK_ORDER,
+    apply_pick, makes_row, parse_pick_order, pick_winners, row_alleles, PickCriterion, PickFlags,
+    PickMode, PickRequest, PredictedRow, DEFAULT_PICK_ORDER,
 };
-use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, GeneAnnotationProvider};
-use fastvep_cache::fasta::FastaReader;
+use fastvep_cache::annotation::{AnnotationProvider, GeneAnnotationProvider};
+use fastvep_cache::fasta::ReferenceFasta;
 use fastvep_cache::info::CacheInfo;
 use fastvep_cache::providers::{
-    FastaSequenceProvider, IndexedTranscriptProvider, MatchedVariant, SequenceProvider,
+    FastaSequenceProvider, IndexedTranscriptProvider, KnownSite, MatchedVariant, SequenceProvider,
     TabixVariationProvider, TranscriptProvider, VariationProvider,
 };
 use fastvep_cache::transcript_cache::StaleCacheFormat;
-use fastvep_consequence::ConsequencePredictor;
-use fastvep_core::Consequence;
+use fastvep_consequence::{ConsequencePredictor, Flank, TranscriptConsequence};
+use fastvep_core::Allele;
 use fastvep_genome::Transcript;
 use fastvep_hgvs;
-use fastvep_io::output;
+use fastvep_io::output::{self, ColumnFlags};
 use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
 use fastvep_io::vcf::VcfParser;
 use rayon::prelude::*;
@@ -31,12 +31,65 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Shared annotation utilities from fastvep-annotate (used by batch pipeline).
 use fastvep_annotate::{
-    annotate_intergenic, annotate_sa_only_scaffold, clipped_span, has_canonical_splice,
-    hgvs_allele, hgvsg_clipped, load_gene_providers, load_sa_providers, shifted_intronic_offset,
-    zip_positions,
+    annotate_intergenic, annotate_sa_only_scaffold, hgvs_allele_on_transcript, hgvsg_per_alt,
+    load_gene_providers, load_sa_providers, splice_context, RowTranscripts,
 };
 
 const BATCH_SIZE: usize = 1024;
+
+/// The fewest records of a batch that one thread looks the known variants of up in a row. A run
+/// starts by finding its place in the cache's file (a question to the index, and a read from
+/// where the index says its first window can begin), so a run of a few records is mostly that.
+/// 16 was chosen, not tuned.
+const MIN_LOOKUP_RUN: usize = 16;
+
+/// VEP flags that change what is written without being a column of their own.
+///
+/// `--force_overwrite` is not here: VEP refuses to write over an existing file without it
+/// and fastVEP always writes over it, so the flag changes nothing and is only accepted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompatFlags {
+    /// `--total_length`: `cDNA_position`, `CDS_position` and `Protein_position` carry the length
+    /// they are counted in, `14/203`.
+    pub total_length: bool,
+    /// `--no_escape`: the `=` of a synonymous `HGVSp` is not written `%3D` and the space of a VCF
+    /// `SYMBOL` is `_` and not `%20`.
+    pub no_escape: bool,
+}
+
+/// Transcripts to leave out of a run, which Ensembl VEP's cache does not hold.
+///
+/// A GFF3 has every transcript of its annotation. VEP's caches are built from a database, and the
+/// build leaves some out (`AnnotationSource::Database::Transcript`): readthrough transcripts and
+/// those of biotype `artifact`, from an Ensembl cache (109 of the 23,382 transcripts of chr21 and
+/// chr22 in Ensembl's GFF3, and the only ones of them the cache lacks), and `--exclude_predicted`
+/// asks VEP for RefSeq's models. None is on by default: dropping real transcripts from a user's
+/// annotation is theirs to decide, where reading the file as it is is not a decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptExclusions {
+    /// `--exclude-predicted`: a stable id that matches `^X._` (`XM_`, `XR_`).
+    pub predicted: bool,
+    /// `--exclude-readthrough`: tagged `readthrough_transcript`.
+    pub readthrough: bool,
+    /// `--exclude-artifact`: biotype `artifact`.
+    pub artifact: bool,
+}
+
+impl TranscriptExclusions {
+    /// Whether any is on.
+    pub fn any(self) -> bool {
+        self != Self::default()
+    }
+
+    /// Whether `transcript` is one of the kinds this run leaves out.
+    pub fn excludes(self, transcript: &Transcript) -> bool {
+        // VEP's pattern: an `X`, any one character, an underscore.
+        let predicted = matches!(transcript.stable_id.as_bytes(), [b'X', _, b'_', ..]);
+        (self.predicted && predicted)
+            || (self.readthrough && transcript.readthrough)
+            || (self.artifact && &*transcript.biotype == "artifact")
+    }
+}
 
 pub struct AnnotateConfig {
     pub input: String,
@@ -48,14 +101,23 @@ pub struct AnnotateConfig {
     pub gff3: Vec<String>,
     pub fasta: Option<String>,
     pub output_format: String,
-    pub pick: bool,
+    /// The `--pick*` / `--flag-pick*` switch this run was given, if any.
+    pub pick: PickFlags,
     pub hgvs: bool,
+    /// The optional tab and CSQ columns VEP adds on request (`--hgvsg`,
+    /// `--biotype`, `--numbers`, ...). `hgvs` is separate: it also decides
+    /// whether the HGVS values are computed at all.
+    pub columns: ColumnFlags,
+    /// `--total_length` and `--no_escape`.
+    pub compat: CompatFlags,
+    /// The kinds of transcript to leave out ([`TranscriptExclusions`]).
+    pub exclude: TranscriptExclusions,
     pub distance: u64,
     pub cache_dir: Option<String>,
     pub transcript_cache: Option<String>,
     /// Directory containing supplementary annotation files (.osa, .osi, .oga).
     pub sa_dir: Option<String>,
-    /// Skip the default 51-field CSQ annotation pipeline and emit only
+    /// Skip the default 49-field CSQ annotation pipeline and emit only
     /// supplementary annotations from `--sa-dir`. Requires `sa_dir`.
     pub sa_only: bool,
     /// Enable ACMG-AMP variant classification.
@@ -107,6 +169,8 @@ struct AnnotationContext<'a> {
     functional_evidence: Option<&'a fastvep_classification::FunctionalEvidenceIndex>,
     oncogenicity_config: Option<&'a fastvep_oncogenicity::OncogenicityConfig>,
     pick_order: &'a [PickCriterion],
+    /// `None` for a run that picks nothing.
+    pick: Option<PickRequest>,
     sample_names: &'a [String],
     /// gnomAD queries need the VCF-style allele rather than fastVEP's
     /// normalised one; set when a gnomAD source is among `sa_providers`.
@@ -115,17 +179,73 @@ struct AnnotationContext<'a> {
     repeat_db_loaded: bool,
 }
 
+/// What the predictor said of one transcript of a variant, or, for a transcript a reducing pick may
+/// leave out and that the variant is merely beside, only what it would say.
+enum Prediction<'a> {
+    Built(TranscriptConsequence, Option<&'a Transcript>),
+    Flank(&'a Transcript, Flank),
+}
+
+impl<'a> Prediction<'a> {
+    fn transcript_id(&self) -> &str {
+        match self {
+            Self::Built(tc, _) => &tc.transcript_id,
+            Self::Flank(transcript, _) => &transcript.stable_id,
+        }
+    }
+
+    /// Whether it makes a row: a transcript with no allele to make a row of makes none, as it never
+    /// did. `flank_alleles` are the alleles of the variant that make a row of a transcript it is
+    /// beside, which are the same for every one of them.
+    ///
+    /// The one place that asks, for the rows a pick chooses among and for the rows then built, so
+    /// that the number a row has in the pick is the number it is given when the rows are made.
+    fn makes_a_row(&self, flank_alleles: &[&Allele]) -> bool {
+        match self {
+            Self::Built(tc, _) => row_alleles(tc).next().is_some(),
+            Self::Flank(..) => !flank_alleles.is_empty(),
+        }
+    }
+
+    /// The row a pick can choose, before it is built.
+    fn as_pickable<'p>(&'p self, flank_alleles: &'p [&'p Allele]) -> PredictedRow<'p> {
+        match self {
+            Self::Built(tc, transcript) => PredictedRow::Built {
+                prediction: tc,
+                transcript: *transcript,
+            },
+            Self::Flank(transcript, flank) => PredictedRow::Flank {
+                transcript,
+                flank: *flank,
+                alleles: flank_alleles,
+            },
+        }
+    }
+}
+
+/// A prediction that becomes a row: with the transcript it was made against, and the alleles of it
+/// a reducing pick chose (`None`: all of them).
+struct Survivor<'a> {
+    prediction: TranscriptConsequence,
+    transcript: Option<&'a Transcript>,
+    chosen: Option<&'a [(usize, usize)]>,
+}
+
+/// The pairs of `winners`, which are sorted, that belong to the row numbered `row`.
+fn winners_of_row(winners: &[(usize, usize)], row: usize) -> &[(usize, usize)] {
+    let start = winners.partition_point(|&(r, _)| r < row);
+    let len = winners[start..].partition_point(|&(r, _)| r == row);
+    &winners[start..start + len]
+}
+
 /// Annotate one variant: transcript overlap, consequence prediction, HGVS,
 /// supplementary annotations, `--pick`, and ACMG classification.
 ///
 /// Called once per variant from the parallel phase of `run_annotate`.
-/// `matched_by_allele` carries the co-located known variants the sequential
-/// phase already looked up for this record.
-fn annotate_variant(
-    ctx: &AnnotationContext<'_>,
-    vf: &mut VariationFeature,
-    matched_by_allele: &HashMap<String, Vec<MatchedVariant>>,
-) {
+/// `known` carries the co-located known variants the sequential phase already
+/// looked up for this record.
+fn annotate_variant(ctx: &AnnotationContext<'_>, vf: &mut VariationFeature, known: &KnownLookup) {
+    let matched_by_allele = &known.by_allele;
     // Destructured rather than used through `ctx.` so the body below reads the
     // same as it did when these were the enclosing function's locals.
     let &AnnotationContext {
@@ -140,10 +260,28 @@ fn annotate_variant(
         functional_evidence,
         oncogenicity_config,
         pick_order,
+        pick,
         sample_names,
         normalize_gnomad_queries,
         repeat_db_loaded,
     } = ctx;
+
+    // VEP's known-variant columns, worked out once per alt allele: every
+    // transcript row of an allele writes the same cells, so the rows borrow them.
+    if config.columns.known.checks_existing() {
+        vf.known = fastvep_annotate::known_cells(
+            &known.site,
+            &vf.ref_allele.to_string(),
+            &known.alleles,
+            config.columns.known,
+        );
+    }
+
+    // Kept for the classification pass at the end, which runs after `--pick`
+    // has deleted rows and needs the transcript each survivor came from.
+    let mut overlapping = Vec::new();
+    // Set when the pick was made before the rows were built, so that it is not made again.
+    let mut picked_before_rows = false;
 
     // In --sa-only mode, skip transcript lookup + consequence
     // prediction + HGVS entirely. Use a neutral scaffold so the SA
@@ -158,13 +296,38 @@ fn annotate_variant(
             1
         };
         let query_end = vf.position.end + config.distance;
-        let overlapping = transcript_provider
+        overlapping = transcript_provider
             .get_transcripts(chrom, query_start, query_end)
             .unwrap_or_default();
 
         if overlapping.is_empty() {
             // Intergenic
             annotate_intergenic(vf);
+            // The variant's own HGVSg is there whether or not a transcript is:
+            // VEP's intergenic output ends in the function that writes HGVSg
+            // (`IntergenicVariationAllele_to_output_hash` returns
+            // `VariationFeatureOverlapAllele_to_output_hash`). Only `--hgvsg`
+            // asks for it here, as it does on the transcript rows; `fastvep-annotate`'s
+            // loop has no flag of its own for it and writes it under `hgvs` on both.
+            if config.columns.hgvsg {
+                let hgvsg = hgvsg_per_alt(
+                    seq_provider.map(|sp| sp as &dyn SequenceProvider),
+                    &vf.position.chromosome,
+                    vf.position.start,
+                    vf.position.end,
+                    &vf.ref_allele,
+                    &vf.alt_alleles,
+                );
+                for tv in &mut vf.transcript_variations {
+                    for aa in &mut tv.allele_annotations {
+                        aa.hgvsg = vf
+                            .alt_alleles
+                            .iter()
+                            .position(|alt| *alt == aa.allele)
+                            .and_then(|i| hgvsg[i].clone());
+                    }
+                }
+            }
             // Populate existing_variation on intergenic annotations too
             for tv in &mut vf.transcript_variations {
                 for aa in &mut tv.allele_annotations {
@@ -174,13 +337,21 @@ fn annotate_variant(
                 }
             }
         } else {
-            // Get reference sequence if available
-            let ref_seq =
-                seq_provider.and_then(|sp| sp.fetch_sequence(chrom, query_start, query_end).ok());
+            // A `--pick*` that deletes the rows it does not choose is settled below on what the
+            // predictor said, and only the rows it chooses are built. A variant of a run with
+            // `--distance 500000` has hundreds of transcripts around it and the pick keeps a few
+            // tens; the rest were built, every string of them cloned and every HGVS description
+            // written, to be deleted a moment later by `apply_pick`, and that was most of what such
+            // a run did. The flagging picks keep every row, so there is nothing to leave out.
+            let plan = pick
+                .filter(|_| !sa_only)
+                .map(|request| request.plan(pick_order))
+                .filter(|plan| plan.mode == PickMode::Reduce);
 
-            // Run consequence prediction — dispatch SVs to SV predictor
-            let transcript_consequences = if vf.variant_type.is_structural() {
-                fastvep_consequence::sv_predictor::predict_sv_consequences(
+            // Consequence prediction, one answer for each transcript with the transcript it was made
+            // against, dispatching structural variants to their own predictor.
+            let predictions: Vec<Prediction<'_>> = if vf.variant_type.is_structural() {
+                let consequences = fastvep_consequence::sv_predictor::predict_sv_consequences(
                     chrom,
                     vf.position.start,
                     vf.position.end,
@@ -189,392 +360,488 @@ fn annotate_variant(
                     &overlapping,
                     config.distance,
                     config.distance,
-                )
-            } else {
-                let result = predictor.predict(
-                    &vf.position,
-                    &vf.ref_allele,
-                    &vf.alt_alleles,
-                    &overlapping,
-                    ref_seq.as_deref(),
                 );
-                result.transcript_consequences
+                // The transcript each prediction was made against.
+                //
+                // The structural-variant predictor emits one consequence per transcript it was
+                // handed, in that order, whenever the record has an ALT (`predict_sv_consequences`),
+                // so index `i` is the match and the scan never runs; a miss falls back to a scan
+                // rather than losing the transcript, because nothing else holds the two together.
+                // Before this, every consequence rescanned the whole overlap set, and a variant in
+                // a gene-dense window - a protocadherin or MHC cluster, where `--distance` pulls in
+                // dozens of transcripts - paid for that lookup in proportion to the square of the
+                // overlap.
+                //
+                // Every transcript is predicted in full here, and a reducing pick only leaves rows
+                // out: the structural-variant predictor has its own answer for a transcript the
+                // change is beside, which `ConsequencePredictor::flank` does not give.
+                consequences
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, tc)| {
+                        let transcript = overlapping
+                            .get(i)
+                            .copied()
+                            .filter(|t| t.stable_id == tc.transcript_id)
+                            .or_else(|| {
+                                overlapping
+                                    .iter()
+                                    .copied()
+                                    .find(|t| t.stable_id == tc.transcript_id)
+                            });
+                        Prediction::Built(tc, transcript)
+                    })
+                    .collect()
+            } else {
+                // No reference window is read for the predictor: it is given none to use (the
+                // transcripts carry their own sequence), and reading the variant's window of
+                // `--distance` bases either side for every variant was a few kilobytes copied out
+                // of the FASTA per record for nothing.
+                //
+                // A transcript the variant is merely beside has the same answer for every allele,
+                // and when a reducing pick is going to choose among the transcripts it is not
+                // predicted in full unless it is chosen. Around a variant that is most of them.
+                overlapping
+                    .iter()
+                    .map(|&transcript| {
+                        if plan.is_some() {
+                            if let Some(flank) = predictor.flank(&vf.position, transcript) {
+                                return Prediction::Flank(transcript, flank);
+                            }
+                        }
+                        Prediction::Built(
+                            predictor.predict_transcript(
+                                &vf.position,
+                                &vf.ref_allele,
+                                &vf.alt_alleles,
+                                transcript,
+                                None,
+                            ),
+                            Some(transcript),
+                        )
+                    })
+                    .collect()
             };
 
-            // Convert prediction results to VariationFeature annotations
-            for (i, tc) in transcript_consequences.iter().enumerate() {
-                // `ConsequencePredictor::predict` emits one consequence per
-                // transcript it was handed, in that order, so index `i` is the
-                // match and the scan below never runs. The structural-variant
-                // branch above makes no such promise, so a miss falls back to a
-                // scan rather than losing the transcript. Before this, every
-                // consequence rescanned the whole overlap set, and a variant in
-                // a gene-dense window - a protocadherin or MHC cluster, where
-                // `--distance` pulls in dozens of transcripts - paid for that
-                // lookup in proportion to the square of the overlap.
-                let transcript: Option<&Transcript> = overlapping
-                    .get(i)
-                    .copied()
-                    .filter(|t| t.stable_id == tc.transcript_id)
-                    .or_else(|| {
-                        overlapping
-                            .iter()
-                            .copied()
-                            .find(|t| t.stable_id == tc.transcript_id)
-                    });
+            // The reference an HGVS description is written against: the genome's, where the VCF
+            // has `N` and where its REF is not the reference's, as Ensembl does for a
+            // substitution (`reference_for_hgvs`). The `g.` description reads it too, so that the
+            // two say the same thing about a record whose REF is wrong.
+            //
+            // Read only by a run that writes a description: it is a read of the FASTA for every
+            // record, a page of a three-gigabyte file that is nowhere else in a run without HGVS,
+            // and the mismatch it counts is about what those descriptions say.
+            let hgvs_ref = if config.hgvs || config.columns.hgvsg {
+                fastvep_annotate::reference_for_hgvs(
+                    seq_provider.map(|sp| sp as &dyn SequenceProvider),
+                    chrom,
+                    vf.position.start,
+                    vf.position.end,
+                    &vf.ref_allele,
+                )
+            } else {
+                std::borrow::Cow::Borrowed(&vf.ref_allele)
+            };
 
-                let allele_annotations: Vec<AlleleAnnotation> = tc
-                    .allele_consequences
+            // HGVSg is the variant's, the same on every transcript row, and reading
+            // the reference to place it is not free: made once per record, and only
+            // when an output carries it (the `HGVSg` column or field, or JSON's key,
+            // which `--hgvs` has always filled).
+            let hgvsg_by_alt =
+                if config.columns.hgvsg || (config.hgvs && config.output_format == "json") {
+                    hgvsg_per_alt(
+                        seq_provider.map(|sp| sp as &dyn SequenceProvider),
+                        chrom,
+                        vf.position.start,
+                        vf.position.end,
+                        &hgvs_ref,
+                        &vf.alt_alleles,
+                    )
+                } else {
+                    Vec::new()
+                };
+
+            // The alleles a transcript that the change is beside gets a row for, which are the
+            // same for every one of them. Only a reducing pick leaves a transcript unbuilt.
+            let flank_alleles: Vec<&Allele> = if plan.is_some() {
+                vf.alt_alleles
                     .iter()
-                    .map(|ac| {
-                        let mut ann = AlleleAnnotation {
-                            allele: ac.allele.clone(),
-                            consequences: ac.consequences.clone(),
-                            impact: ac.impact,
-                            cdna_position: zip_positions(ac.cdna_start, ac.cdna_end),
-                            cds_position: zip_positions(ac.cds_start, ac.cds_end),
-                            protein_position: ac.protein_range(),
-                            amino_acids: ac.amino_acids.clone(),
-                            codons: ac.codons.clone(),
-                            exon: ac.exon,
-                            intron: ac.intron,
-                            // Off the transcript, not off the HGVSc, and over
-                            // the span the allele actually changes: the bases a
-                            // pair repeats at either end are by definition
-                            // unchanged, and counting them can only make a
-                            // change look nearer a splice site than it is.
-                            //
-                            // Only the classifier reads it, and finding it
-                            // walks the transcript's introns once per end of
-                            // the span, per (variant x transcript x allele).
-                            // So it is found when something is going to ask,
-                            // the way `hgvsc` is built only under `--hgvs`.
-                            intron_offset: acmg_config.and(transcript).and_then(|tr| {
-                                let (s, e) = clipped_span(
-                                    tr.strand,
-                                    vf.position.start,
-                                    vf.position.end,
-                                    &vf.ref_allele,
-                                    &ac.allele,
-                                );
-                                tr.intronic_offset_covered(s, e)
-                            }),
-                            // The same distance where HGVS numbers the change rather
-                            // than where it sits, which is what PVS1's gate is
-                            // calibrated to, and only for the variants that gate
-                            // looks at: walking the reference twice for every indel
-                            // would be work done before knowing it is needed.
-                            shifted_intron_offset: acmg_config
-                                .and(transcript)
-                                .filter(|_| has_canonical_splice(&ac.consequences))
-                                .and_then(|tr| {
-                                    shifted_intronic_offset(
+                    .filter(|allele| makes_row(allele))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // The pick of a reducing `--pick*`, made on the predictions before any row exists. The
+            // number a row has in it is its position among the predictions that make a row.
+            let mut rows_picked_among = 0usize;
+            let winners: Option<Vec<(usize, usize)>> = plan.map(|plan| {
+                let rows: Vec<PredictedRow<'_>> = predictions
+                    .iter()
+                    .filter(|prediction| prediction.makes_a_row(&flank_alleles))
+                    .map(|prediction| prediction.as_pickable(&flank_alleles))
+                    .collect();
+                rows_picked_among = rows.len();
+                let mut winners = pick_winners(&rows, &plan);
+                // sorted, so that `winners_of_row` finds a row's winners by search
+                winners.sort_unstable();
+                winners
+            });
+            picked_before_rows = winners.is_some();
+
+            // The predictions that become rows, each with the alleles of it that do. A prediction
+            // that makes no row makes none, as it never did, and a row a reducing pick did not
+            // choose is neither built nor, if it was left unbuilt above, predicted in full.
+            let mut row_number = 0usize;
+            let mut survivors: Vec<Survivor<'_>> = Vec::new();
+            for prediction in predictions {
+                if !prediction.makes_a_row(&flank_alleles) {
+                    continue;
+                }
+                // A row without a feature is no candidate of a pick, which neither chooses nor
+                // deletes it (`apply_pick` does the same with the rows it is given)
+                let featureless = prediction.transcript_id() == TranscriptVariation::NO_FEATURE;
+                let chosen: Option<&[(usize, usize)]> = winners.as_deref().map(|winners| {
+                    let chosen = winners_of_row(winners, row_number);
+                    row_number += 1;
+                    chosen
+                });
+                if matches!(chosen, Some(c) if c.is_empty()) && !featureless {
+                    continue;
+                }
+                let (prediction, transcript) = match prediction {
+                    Prediction::Built(tc, transcript) => (tc, transcript),
+                    Prediction::Flank(transcript, _) => {
+                        let tc = predictor.predict_transcript(
+                            &vf.position,
+                            &vf.ref_allele,
+                            &vf.alt_alleles,
+                            transcript,
+                            None,
+                        );
+                        // the pick numbered this row's alleles from `flank_alleles`, so the
+                        // prediction has to have the same alleles in the same order
+                        debug_assert!(
+                            row_alleles(&tc)
+                                .map(|ac| &ac.allele)
+                                .eq(flank_alleles.iter().copied()),
+                            "{}: the alleles of a transcript the change is beside",
+                            transcript.stable_id
+                        );
+                        (tc, Some(transcript))
+                    }
+                };
+                survivors.push(Survivor {
+                    prediction,
+                    transcript,
+                    chosen,
+                });
+            }
+            debug_assert!(
+                winners.is_none() || row_number == rows_picked_among,
+                "the pick was made among {rows_picked_among} rows and {row_number} were numbered"
+            );
+
+            // Convert prediction results to VariationFeature annotations
+            for survivor in &survivors {
+                let tc = &survivor.prediction;
+                let transcript = survivor.transcript;
+                // Which alleles of this transcript the pick chose, when it was made before the
+                // rows; `None` builds them all.
+                let chosen = survivor.chosen;
+
+                // `*` and the placeholders (`.`, `<NON_REF>`, `<*>`) are not variants of
+                // the transcript, and VEP writes no row for them: a record whose only ALT
+                // is one has no row here, and the real ALTs beside one keep theirs.
+                // Sized for the alleles there are: collecting a filtered iterator starts a `Vec` at four
+                // elements, and an `AlleleAnnotation` is over 600 bytes, so every transcript row of a one-ALT
+                // record asked for 2.5 KB and used 0.6 KB of it.
+                let mut allele_annotations: Vec<AlleleAnnotation> =
+                    Vec::with_capacity(chosen.map_or(tc.allele_consequences.len(), <[_]>::len));
+                allele_annotations.extend(
+                    row_alleles(tc)
+                        .enumerate()
+                        .filter(|(ai, _)| {
+                            chosen.is_none_or(|chosen| chosen.iter().any(|&(_, a)| a == *ai))
+                                || &*tc.transcript_id == TranscriptVariation::NO_FEATURE
+                        })
+                        .map(|(_, ac)| {
+                            let mut ann = AlleleAnnotation {
+                                allele: ac.allele.clone(),
+                                consequences: ac.consequences.clone(),
+                                impact: ac.impact,
+                                location: ac.location,
+                                protein_position: ac.protein_range(),
+                                amino_acids: ac.amino_acids.clone(),
+                                codons: ac.codons.clone(),
+                                exon: ac.exon,
+                                splice: Default::default(),
+                                distance: ac.distance,
+                                protein_length: ac.protein_length,
+                                escapes_nmd: ac.escapes_nmd,
+                                hgvsc: None,
+                                hgvsp: None,
+                                hgvsg: None,
+                                hgvs_offset: None,
+                                // Nothing is looked up, and no `String` made to look it up with, in a run
+                                // that has no known variants (the cache is what finds them)
+                                existing_variation: if matched_by_allele.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    matched_by_allele
+                                        .get(&ac.allele.to_string())
+                                        .map(|matches| {
+                                            matches.iter().map(|m| m.name.clone()).collect()
+                                        })
+                                        .unwrap_or_default()
+                                },
+                                sift: None,
+                                polyphen: None,
+                                supplementary: Vec::new(),
+                                acmg_classification: None,
+                                pick: false,
+                                oncogenicity_classification: None,
+                            };
+
+                            // `--total_length` is a matter of the cells and of nothing that is
+                            // worked out from them: `ac.location`, which the HGVS code reads, has
+                            // no totals. A structural variant's cells are not written the way
+                            // VEP writes them, with or without the flag, so it gets none.
+                            if config.compat.total_length && !vf.variant_type.is_structural() {
+                                if let Some(tr) = transcript {
+                                    tr.apply_total_length(
+                                        &mut ann.location,
+                                        vf.position.start,
+                                        vf.position.end,
+                                    );
+                                }
+                            }
+
+                            // HGVSg belongs to the variant and needs no transcript, so
+                            // `--hgvsg` has it without `--hgvs`.
+                            if !hgvsg_by_alt.is_empty() {
+                                ann.hgvsg = vf
+                                    .alt_alleles
+                                    .iter()
+                                    .position(|alt| *alt == ac.allele)
+                                    .and_then(|i| hgvsg_by_alt[i].clone());
+                            }
+
+                            // How far the HGVS description moved 3' from the VCF's own position
+                            let mut shift = 0u64;
+
+                            // Generate HGVS if requested
+                            if config.hgvs {
+                                // An ALT that is not plain bases (`N`) has no HGVSc, as in
+                                // Ensembl (`return undef if variation_feature_seq =~
+                                // m/[^ACGT\-]/`).
+                                if let Some(tr) = transcript.filter(|_| ac.allele.is_plain_bases())
+                                {
+                                    // Build versioned IDs for HGVS notation
+                                    let versioned_tid = match tr.version {
+                                        Some(v) => format!("{}.{}", tc.transcript_id, v),
+                                        None => tc.transcript_id.to_string(),
+                                    };
+
+                                    // Read the way HGVS reads it: clipped of the
+                                    // bases the pair repeats at either end, and
+                                    // facing the transcript. A multi-allelic record
+                                    // is trimmed once for the whole site, so an
+                                    // allele that reaches here as a replacement may
+                                    // still be a plain deletion.
+                                    let hv = hgvs_allele_on_transcript(
                                         seq_provider.map(|sp| sp as &dyn SequenceProvider),
                                         chrom,
                                         tr,
                                         vf.position.start,
                                         vf.position.end,
-                                        &vf.ref_allele,
+                                        &hgvs_ref,
                                         &ac.allele,
-                                    )
-                                }),
-                            distance: ac.distance,
-                            protein_length: ac.protein_length,
-                            escapes_nmd: ac.escapes_nmd,
-                            hgvsc: None,
-                            hgvsp: None,
-                            hgvsg: None,
-                            hgvs_offset: None,
-                            existing_variation: matched_by_allele
-                                .get(&ac.allele.to_string())
-                                .map(|matches| matches.iter().map(|m| m.name.clone()).collect())
-                                .unwrap_or_default(),
-                            sift: None,
-                            polyphen: None,
-                            supplementary: Vec::new(),
-                            acmg_classification: None,
-                            oncogenicity_classification: None,
-                        };
-
-                        // Generate HGVS if requested
-                        if config.hgvs {
-                            ann.hgvsg = Some(hgvsg_clipped(
-                                chrom,
-                                vf.position.start,
-                                vf.position.end,
-                                &vf.ref_allele,
-                                &ac.allele,
-                            ));
-
-                            if let Some(tr) = transcript {
-                                // Build versioned IDs for HGVS notation
-                                let versioned_tid = match tr.version {
-                                    Some(v) => format!("{}.{}", tc.transcript_id, v),
-                                    None => tc.transcript_id.to_string(),
-                                };
-
-                                // Read the way HGVS reads it: clipped of the
-                                // bases the pair repeats at either end, and
-                                // facing the transcript. A multi-allelic record
-                                // is trimmed once for the whole site, so an
-                                // allele that reaches here as a replacement may
-                                // still be a plain deletion.
-                                let hv = hgvs_allele(
-                                    tr.strand,
-                                    vf.position.start,
-                                    vf.position.end,
-                                    &vf.ref_allele,
-                                    &ac.allele,
-                                    // `zip` and not `zip_positions`: a pair with one end
-                                    // mapped is a variant with one end in an exon and
-                                    // the other in an intron, which has no cDNA span at
-                                    // all. Collapsing it to a point names one base of a
-                                    // change that covers seventeen.
-                                    ac.cdna_start
-                                        .zip(ac.cdna_end)
-                                        .map(|(a, b)| (a.min(b), a.max(b))),
-                                );
-
-                                // Every indel is 3'-shifted over the genome, so
-                                // it routes through `hgvsc_shifted` whether or
-                                // not both its ends are exonic: the shift
-                                // crosses splice sites, and the description has
-                                // to follow it there. Without a reference
-                                // there is no walk to make, so those fall to the
-                                // cDNA renderer below, which shifts on the
-                                // spliced sequence instead - not the same answer
-                                // across a splice site, but the only one
-                                // available. `hgvsc_shifted` also returns `None`
-                                // for a variant it cannot place at all, and that
-                                // falls the same way.
-                                let shifted = (fastvep_annotate::is_shiftable_indel(
-                                    &hv.hgvs_ref,
-                                    &hv.hgvs_alt,
-                                ) && seq_provider.is_some())
-                                .then(|| {
-                                    fastvep_annotate::hgvsc_shifted(
-                                        seq_provider.map(|sp| sp as &dyn SequenceProvider),
-                                        chrom,
-                                        tr,
-                                        &versioned_tid,
-                                        hv.start,
-                                        hv.end,
-                                        &hv.genomic_ref,
-                                        &hv.genomic_alt,
-                                        &hv.hgvs_ref,
-                                        &hv.hgvs_alt,
-                                        tr.cdna_coding_start,
-                                        tr.cdna_coding_end,
-                                    )
-                                })
-                                .flatten();
-                                ann.hgvsc = match (shifted, tr.cdna_coding_start) {
-                                    (Some(h), _) => Some(h),
-                                    (None, Some(coding_start)) => match hv.cdna {
-                                        Some((cs, ce)) => fastvep_hgvs::hgvsc_with_seq(
-                                            &versioned_tid,
-                                            cs,
-                                            ce,
+                                        // `zip`: a pair with one end mapped is a variant with
+                                        // one end in an exon and the other in an intron, which
+                                        // has no cDNA span at all. Collapsing it to a point
+                                        // names one base of a change that covers seventeen.
+                                        // (The `cDNA_position` cell says `601-?` for it.)
+                                        ac.cdna_start
+                                            .zip(ac.cdna_end)
+                                            .map(|(a, b)| (a.min(b), a.max(b))),
+                                    );
+                                    if let Some(hv) = hv {
+                                        // Every indel is 3'-shifted over the genome, so
+                                        // it routes through `hgvsc_shifted` whether or
+                                        // not both its ends are exonic: the shift
+                                        // crosses splice sites, and the description has
+                                        // to follow it there. Without a reference
+                                        // there is no walk to make, so those fall to the
+                                        // cDNA renderer below, which shifts on the
+                                        // spliced sequence instead - not the same answer
+                                        // across a splice site, but the only one
+                                        // available. `hgvsc_shifted` also returns `None`
+                                        // for a variant it cannot place at all, and that
+                                        // falls the same way.
+                                        let shifted = (fastvep_annotate::is_shiftable_indel(
                                             &hv.hgvs_ref,
                                             &hv.hgvs_alt,
-                                            coding_start,
-                                            tr.cdna_coding_end,
-                                            tr.spliced_seq.as_deref(),
-                                            tr.codon_table_start_phase,
-                                        ),
-                                        // Not "is this intronic": a variant
-                                        // with one end in an exon and the
-                                        // other in an intron has no exonic
-                                        // cDNA pair, and `intron_at` reads
-                                        // its first base only.
-                                        None => fastvep_annotate::hgvsc_shifted(
-                                            seq_provider.map(|sp| sp as &dyn SequenceProvider),
-                                            chrom,
-                                            tr,
-                                            &versioned_tid,
-                                            hv.start,
-                                            hv.end,
-                                            &hv.genomic_ref,
-                                            &hv.genomic_alt,
-                                            &hv.hgvs_ref,
-                                            &hv.hgvs_alt,
-                                            Some(coding_start),
-                                            tr.cdna_coding_end,
-                                        ),
-                                    },
-                                    // Non-coding transcript: use n. notation
-                                    (None, None) => match hv.cdna {
-                                        Some((cs, ce)) => fastvep_hgvs::hgvsc_noncoding(
-                                            &versioned_tid,
-                                            cs,
-                                            ce,
-                                            &hv.hgvs_ref,
-                                            &hv.hgvs_alt,
-                                            tr.spliced_seq.as_deref(),
-                                        ),
-                                        None => fastvep_annotate::hgvsc_shifted(
-                                            seq_provider.map(|sp| sp as &dyn SequenceProvider),
-                                            chrom,
-                                            tr,
-                                            &versioned_tid,
-                                            hv.start,
-                                            hv.end,
-                                            &hv.genomic_ref,
-                                            &hv.genomic_alt,
-                                            &hv.hgvs_ref,
-                                            &hv.hgvs_alt,
-                                            None,
-                                            None,
-                                        ),
-                                    },
-                                };
-                            }
-
-                            if let (Some(ref aa), Some(ps)) = (&ac.amino_acids, ac.protein_start) {
-                                // The residue pair is strand-ordered: which of the two is
-                                // the lower one depends on the strand, and
-                                // `hgvsp_inframe_indel` needs both to place an insertion
-                                // between two residues. A variant on an exon's edge has one
-                                // end outside the CDS and so may have only one coordinate;
-                                // using it for both is what the single one meant before.
-                                let pe = ac.protein_end.unwrap_or(ps);
-                                if let Some(tr) = transcript {
-                                    if let Some(ref pid) = tr.protein_id {
-                                        let versioned_pid = match tr.protein_version {
-                                            Some(v) => {
-                                                let suffix = format!(".{}", v);
-                                                if pid.ends_with(&suffix) {
-                                                    pid.clone()
-                                                } else {
-                                                    format!("{}.{}", pid, v)
-                                                }
-                                            }
-                                            None => pid.clone(),
-                                        };
-                                        let is_fs = ac.consequences.contains(&Consequence::FrameshiftVariant);
-                                        // A lost terminator names how much
-                                        // protein the loss adds, which needs the
-                                        // sequence past the stop for the same
-                                        // reason a frameshift does. `None` when
-                                        // the change is not an equal-length
-                                        // replacement of the terminator's codon,
-                                        // and then the chain below describes it.
-                                        let stop_lost_extension = (!is_fs
-                                            && ac.consequences.contains(&Consequence::StopLost))
-                                            .then(|| {
-                                                let spliced = tr.spliced_seq.as_deref()?;
-                                                let coding_start = tr.cdna_coding_start?;
-                                                let cds = fastvep_annotate::cds_and_downstream(
-                                                    tr,
-                                                    spliced,
-                                                    coding_start,
-                                                )?;
-                                                fastvep_hgvs::hgvsp_stop_lost_from_cds(
-                                                    &versioned_pid,
-                                                    &cds,
-                                                    ac.cds_start,
-                                                    ac.cds_end,
-                                                    &vf.ref_allele,
-                                                    &ac.allele,
-                                                    tr.strand,
-                                                    &fastvep_annotate::frameshift_codon_table(tr),
-                                                )
-                                            })
-                                            .flatten();
-
-                                        if stop_lost_extension.is_some() {
-                                            ann.hgvsp = stop_lost_extension;
-                                        } else if is_fs {
-                                            if let (
-                                                Some(spliced),
-                                                Some(coding_start),
-                                            ) = (
-                                                tr.spliced_seq.as_deref(),
+                                        ) && seq_provider.is_some())
+                                        .then(|| {
+                                            fastvep_annotate::hgvsc_shifted_outcome(
+                                                seq_provider.map(|sp| sp as &dyn SequenceProvider),
+                                                chrom,
+                                                tr,
+                                                &versioned_tid,
+                                                hv.start,
+                                                hv.end,
+                                                hv.anchor_start,
+                                                &hv.genomic_ref,
+                                                &hv.genomic_alt,
+                                                &hv.hgvs_ref,
+                                                &hv.hgvs_alt,
                                                 tr.cdna_coding_start,
-                                            ) {
-                                                ann.hgvsp =
-                                                    fastvep_annotate::cds_and_downstream(
-                                                        tr,
-                                                        spliced,
-                                                        coding_start,
-                                                    )
-                                                    .and_then(|cds| {
-                                                        fastvep_hgvs::hgvsp_frameshift_from_cds(
-                                                            &versioned_pid,
-                                                            &cds,
-                                                            ac.cds_start,
-                                                            ac.cds_end,
-                                                            &vf.ref_allele,
-                                                            &ac.allele,
-                                                            tr.strand,
-                                                            &fastvep_annotate::frameshift_codon_table(tr),
-                                                        )
-                                                    });
+                                                tr.cdna_coding_end,
+                                                hv.shift,
+                                            )
+                                        });
+                                        ann.hgvsc = match (shifted, tr.cdna_coding_start) {
+                                            (
+                                                Some(fastvep_annotate::ShiftedHgvsc::Written(
+                                                    h,
+                                                    moved,
+                                                )),
+                                                _,
+                                            ) => {
+                                                shift = moved;
+                                                Some(h)
                                             }
-                                        } else if aa.1 == "-"
-                                            || aa.0.len() != aa.1.len()
-                                            || ac.consequences.contains(&Consequence::StartLost)
-                                            || ac.consequences.contains(&Consequence::InframeDeletion)
-                                            || ac.consequences.contains(&Consequence::InframeInsertion)
-                                            // A window wider than one residue also routes here
-                                            // even when the lengths match: `hgvsp()` compares one
-                                            // residue per side, so `EP/ET` reads as unchanged and
-                                            // renders `p.Glu153=` for a change VEP calls
-                                            // `p.Pro154Thr` - and a synonymous two-residue window
-                                            // needs its whole span named.
-                                            || aa.0.len() > 1
-                                        {
-                                            // In-frame indel / delins (frameshift handled
-                                            // above). aa.0 holds the replaced residues, aa.1 the
-                                            // replacement ("-" for a pure deletion).
-                                            //
-                                            // Insertions must route here too, not to `hgvsp()`:
-                                            // that compares only the first residue of each side,
-                                            // so `W/WR` reads as unchanged and renders
-                                            // `p.Trp185=` for a variant that lengthens the
-                                            // protein.
-                                            //
-                                            // The residue counts decide, not the SO term. A
-                                            // delins that replaces residues earns
-                                            // `protein_altering_variant` or `stop_gained` rather
-                                            // than either in-frame term, and keying on the term
-                                            // alone dropped HGVSp entirely for every one of them
-                                            // - 1,560 rows over the ClinVar 2-star in-frame
-                                            // delins, where VEP names `p.Lys666delinsAsnSer`.
-                                            //
-                                            // The peptide lets `hgvsp_inframe_indel` apply the
-                                            // HGVS 3'-rule and collapse a repeat to `dup`,
-                                            // matching Ensembl VEP; it degrades to the
-                                            // unshifted description without one.
-                                            // `tr.strand` says which end of
-                                            // `aa.0` the `ps` above names: on
-                                            // the reverse strand a shrinking
-                                            // change arrives anchored at the
-                                            // end of its span (#89, #96).
-                                            ann.hgvsp = fastvep_hgvs::hgvsp_inframe_indel(
-                                                &versioned_pid,
-                                                ps,
-                                                pe,
-                                                &aa.0,
-                                                &aa.1,
-                                                tr.peptide.as_deref().map(str::as_bytes),
-                                                tr.strand,
-                                            );
-                                        } else {
-                                            let ref_aa_byte = aa.0.as_bytes().first().copied().unwrap_or(b'X');
-                                            let alt_aa_byte = aa.1.as_bytes().first().copied().unwrap_or(b'X');
-                                            ann.hgvsp = fastvep_hgvs::hgvsp(
-                                                &versioned_pid, ps, ref_aa_byte, alt_aa_byte, false,
-                                            );
-                                        }
+                                            // A description the 3'-rule carries off the end of the transcript, or one for a
+                                            // change that is not a plain overlap of it: Ensembl writes nothing, and the cDNA
+                                            // renderer below must not write what Ensembl would not.
+                                            (
+                                                Some(fastvep_annotate::ShiftedHgvsc::NoDescription),
+                                                _,
+                                            ) => None,
+                                            (
+                                                Some(fastvep_annotate::ShiftedHgvsc::CannotRender)
+                                                | None,
+                                                Some(coding_start),
+                                            ) => match hv.cdna {
+                                                Some((cs, ce)) => fastvep_hgvs::hgvsc_with_seq(
+                                                    &versioned_tid,
+                                                    cs,
+                                                    ce,
+                                                    &hv.hgvs_ref,
+                                                    &hv.hgvs_alt,
+                                                    coding_start,
+                                                    tr.cdna_coding_end,
+                                                    tr.spliced_seq.as_deref(),
+                                                    tr.codon_table_start_phase,
+                                                ),
+                                                // Not "is this intronic": a variant
+                                                // with one end in an exon and the
+                                                // other in an intron has no exonic
+                                                // cDNA pair, and `intron_at` reads
+                                                // its first base only.
+                                                None => fastvep_annotate::hgvsc_shifted_with_shift(
+                                                    seq_provider
+                                                        .map(|sp| sp as &dyn SequenceProvider),
+                                                    chrom,
+                                                    tr,
+                                                    &versioned_tid,
+                                                    hv.start,
+                                                    hv.end,
+                                                    hv.anchor_start,
+                                                    &hv.genomic_ref,
+                                                    &hv.genomic_alt,
+                                                    &hv.hgvs_ref,
+                                                    &hv.hgvs_alt,
+                                                    Some(coding_start),
+                                                    tr.cdna_coding_end,
+                                                    hv.shift,
+                                                )
+                                                .map(|(h, moved)| {
+                                                    shift = moved;
+                                                    h
+                                                }),
+                                            },
+                                            // Non-coding transcript: use n. notation
+                                            (
+                                                Some(fastvep_annotate::ShiftedHgvsc::CannotRender)
+                                                | None,
+                                                None,
+                                            ) => match hv.cdna {
+                                                Some((cs, ce)) => fastvep_hgvs::hgvsc_noncoding(
+                                                    &versioned_tid,
+                                                    cs,
+                                                    ce,
+                                                    &hv.hgvs_ref,
+                                                    &hv.hgvs_alt,
+                                                    tr.spliced_seq.as_deref(),
+                                                ),
+                                                None => fastvep_annotate::hgvsc_shifted_with_shift(
+                                                    seq_provider
+                                                        .map(|sp| sp as &dyn SequenceProvider),
+                                                    chrom,
+                                                    tr,
+                                                    &versioned_tid,
+                                                    hv.start,
+                                                    hv.end,
+                                                    hv.anchor_start,
+                                                    &hv.genomic_ref,
+                                                    &hv.genomic_alt,
+                                                    &hv.hgvs_ref,
+                                                    &hv.hgvs_alt,
+                                                    None,
+                                                    None,
+                                                    hv.shift,
+                                                )
+                                                .map(|(h, moved)| {
+                                                    shift = moved;
+                                                    h
+                                                }),
+                                            },
+                                        };
                                     }
                                 }
-                            }
-                        }
 
-                        ann
-                    })
-                    .collect();
+                                // HGVSp
+                                if let Some(tr) = transcript {
+                                    ann.hgvsp = fastvep_annotate::hgvsp_for_allele(
+                                        &fastvep_annotate::HgvspRequest {
+                                            predictor,
+                                            transcript: tr,
+                                            provider: seq_provider
+                                                .map(|sp| sp as &dyn SequenceProvider),
+                                            chrom,
+                                            start: vf.position.start,
+                                            end: vf.position.end,
+                                            ref_allele: &vf.ref_allele,
+                                            alt_allele: &ac.allele,
+                                            location: &ac.location,
+                                            consequences: &ac.consequences,
+                                            amino_acids: ac
+                                                .amino_acids
+                                                .as_ref()
+                                                .map(|(r, a)| (r.as_str(), a.as_str())),
+                                            coding_sequence_kept: ac.coding_sequence_kept,
+                                        },
+                                    );
+                                }
+                            }
+
+                            // VEP's HGVS_OFFSET: the distance the description moved,
+                            // signed by the strand (`offset * strand`), and only when
+                            // there is a description to have moved.
+                            if shift > 0 && (ann.hgvsc.is_some() || ann.hgvsp.is_some()) {
+                                let strand = transcript.map_or(1, |t| t.strand.as_int());
+                                ann.hgvs_offset = Some(shift as i64 * i64::from(strand));
+                            }
+
+                            ann
+                        }),
+                );
+
+                if allele_annotations.is_empty() {
+                    continue;
+                }
 
                 // Collect every transcript here; --pick filtering runs as a
                 // single post-pass below so it can compare all candidates
@@ -604,14 +871,18 @@ fn annotate_variant(
         } // close `else` of overlapping.is_empty()
     } // close `else` of `if sa_only`
 
-    // Apply --pick before SA/gene/ACMG so those passes only run on the
-    // single surviving transcript. Running pick after them would still
-    // produce correct output but would waste the most expensive work
-    // (ACMG classification) on transcripts that get thrown away.
-    if config.pick && !sa_only && has_transcripts_to_pick(&vf.transcript_variations) {
-        if let Some(idx) = pick_best_transcript_idx_with(&vf.transcript_variations, pick_order) {
-            vf.transcript_variations = vec![vf.transcript_variations.swap_remove(idx)];
-        }
+    // Apply the pick before SA/gene/ACMG so those passes only run on the
+    // surviving transcripts. Running it after would still produce correct
+    // output but would waste the most expensive work (ACMG classification)
+    // on transcripts that get thrown away.
+    //
+    // That saving is exactly what a `--flag-pick*` run gives up: flagging
+    // retains every transcript by definition, so classification runs on all
+    // of them. The order still matters for the reducing modes, and putting
+    // the two in the same place keeps the flag and the reduction deciding
+    // from identical inputs.
+    if let Some(request) = pick.filter(|_| !sa_only && !picked_before_rows) {
+        apply_pick(&mut vf.transcript_variations, &request.plan(pick_order));
     }
 
     // Supplementary annotation: query SA providers once per unique
@@ -628,97 +899,13 @@ fn annotate_variant(
     // never allocated, unless --somatic is on.
     let mut gnomad_answered = vec![false; oncogenicity_config.map_or(0, |_| vf.alt_alleles.len())];
     if !sa_providers.is_empty() {
-        let chrom = &vf.position.chromosome;
-        let sa_queries = vf.query_alleles();
-        let mut allele_results: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for tv in &vf.transcript_variations {
-            for aa in &tv.allele_annotations {
-                let allele_key = aa.allele.to_string();
-                if allele_results.contains_key(&allele_key) {
-                    continue;
-                }
-                let mut gnomad_ok = false;
-                let mut gnomad_failed = false;
-                let (query_pos, ref_str, alt_str) = sa_queries
-                    .iter()
-                    .find(|(allele, _, _, _)| allele == &allele_key)
-                    .map(|(_, pos, ref_allele, alt_allele)| {
-                        (*pos, ref_allele.clone(), alt_allele.clone())
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            vf.position.start,
-                            vf.ref_allele.to_string(),
-                            allele_key.clone(),
-                        )
-                    });
-                // gnomAD stores left-aligned, parsimonious alleles; the
-                // raw input representation can differ for indels (esp.
-                // in repeats), silently missing the match and making
-                // PM2 misfire on common variants. Normalize the query to
-                // gnomAD's minimal representation — only when a gnomAD
-                // provider and a reference are present, and applied only
-                // to the gnomAD lookup (other sources keep the raw key).
-                let gnomad_norm = if normalize_gnomad_queries {
-                    seq_provider.map(|sp| {
-                        fastvep_cache::normalize::normalize_variant(
-                            sp, chrom, query_pos, &ref_str, &alt_str,
-                        )
-                    })
-                } else {
-                    None
-                };
-                let mut results: Vec<(String, String)> = Vec::new();
-                for sa in sa_providers {
-                    let (sa_pos, sa_ref, sa_alt) = if sa.metadata().match_by_allele {
-                        if sa.json_key() == "gnomad" {
-                            match &gnomad_norm {
-                                Some(n) => (n.pos, n.ref_allele.as_str(), n.alt_allele.as_str()),
-                                None => (query_pos, ref_str.as_str(), alt_str.as_str()),
-                            }
-                        } else {
-                            (query_pos, ref_str.as_str(), alt_str.as_str())
-                        }
-                    } else {
-                        (vf.position.start, "", "")
-                    };
-                    // A failed lookup is not a miss: see `SaLookupErrors`.
-                    let lookup = sa.annotate_position(chrom, sa_pos, sa_ref, sa_alt);
-                    // Only a gnomAD database that holds this chromosome can
-                    // answer for it: a per-chromosome shard asked about another
-                    // chromosome returns Ok(None), which is not "no record".
-                    if !gnomad_answered.is_empty()
-                        && sa.json_key() == "gnomad"
-                        && sa.covers_chrom(chrom) == Some(true)
-                    {
-                        match &lookup {
-                            Ok(_) => gnomad_ok = true,
-                            Err(_) => gnomad_failed = true,
-                        }
-                    }
-                    match lookup {
-                        Ok(Some(ann)) => {
-                            let json_str = match ann {
-                                AnnotationValue::Json(j) => j,
-                                AnnotationValue::Positional(j) => j,
-                                AnnotationValue::Interval(v) => {
-                                    format!("[{}]", v.join(","))
-                                }
-                            };
-                            results.push((sa.json_key().to_string(), json_str));
-                        }
-                        Ok(None) => {}
-                        Err(e) => fastvep_annotate::sa_lookup_errors().record(sa.json_key(), &e),
-                    }
-                }
-                if gnomad_ok && !gnomad_failed {
-                    if let Some(i) = vf.alt_alleles.iter().position(|a| *a == aa.allele) {
-                        gnomad_answered[i] = true;
-                    }
-                }
-                allele_results.insert(allele_key, results);
-            }
-        }
+        let allele_results = fastvep_annotate::supplementary_and_gnomad_answered(
+            vf,
+            sa_providers,
+            seq_provider.map(|sp| sp as &dyn SequenceProvider),
+            normalize_gnomad_queries,
+            &mut gnomad_answered,
+        );
         for tv in &mut vf.transcript_variations {
             for aa in &mut tv.allele_annotations {
                 if let Some(results) = allele_results.get(&aa.allele.to_string()) {
@@ -760,6 +947,7 @@ fn annotate_variant(
         // `extract_classification_input` is handed a transcript-level
         // view that carries none.
         let query_alleles = vf.query_alleles();
+        let mut row_transcripts = RowTranscripts::new(&overlapping);
 
         for tv in &mut vf.transcript_variations {
             let gene_sym = tv.gene_symbol.as_deref().unwrap_or("");
@@ -768,8 +956,21 @@ fn annotate_variant(
                 .iter()
                 .filter(|ga| ga.gene_symbol == gene_sym)
                 .collect();
+            let transcript = row_transcripts.of(&tv.transcript_id);
             for aa in &mut tv.allele_annotations {
                 let alt_idx = vf.alt_alleles.iter().position(|a| *a == aa.allele);
+                if let Some(tr) = transcript {
+                    aa.splice = splice_context(
+                        seq_provider.map(|sp| sp as &dyn SequenceProvider),
+                        &vf.position.chromosome,
+                        tr,
+                        vf.position.start,
+                        vf.position.end,
+                        &vf.ref_allele,
+                        &aa.allele,
+                        &aa.consequences,
+                    );
+                }
                 let input = fastvep_classification::extract_classification_input(
                     &aa.consequences,
                     aa.impact,
@@ -778,8 +979,7 @@ fn annotate_variant(
                     aa.amino_acids.as_ref(),
                     aa.protein_position.map(|(s, _)| s),
                     aa.hgvsc.as_deref(),
-                    aa.intron_offset,
-                    aa.shifted_intron_offset,
+                    aa.splice,
                     aa.exon,
                     aa.protein_length,
                     aa.escapes_nmd,
@@ -821,7 +1021,7 @@ fn annotate_variant(
                 // could have found it, which takes two things.
                 //
                 // First, a gnomAD database that holds this chromosome answered
-                // without error (`gnomad_answered`, set in the SA loop). A
+                // without error (`gnomad_answered`, set by the SA lookup). A
                 // run-wide "gnomAD is loaded" flag is not enough: the SA build
                 // writes one database per chromosome, and a shard asked about a
                 // chromosome it does not hold answers Ok(None), the same as "no
@@ -976,7 +1176,7 @@ fn load_transcript_models(
                                          sidecar is built alongside it."
                                     ),
                                     None => format!(
-                                        "it could not be read ({e}), and is most likely \
+                                        "it could not be read ({e:#}), and is most likely \
                                          truncated or corrupt - delete it and rebuild with \
                                          `fastvep cache`."
                                     ),
@@ -1004,7 +1204,7 @@ fn load_transcript_models(
                                     log::debug!("{}", stale.detail);
                                 }
                                 None => eprintln!(
-                                    "Warning: sidecar cache {} could not be loaded ({e}); rebuilding from GFF3",
+                                    "Warning: sidecar cache {} could not be loaded ({e:#}); rebuilding from GFF3",
                                     cp.display()
                                 ),
                             }
@@ -1077,29 +1277,35 @@ fn load_transcript_models(
     Ok((transcripts, region_restricted))
 }
 
-/// Open the reference FASTA named by `--fasta`, preferring the memory-mapped
-/// reader when a `.fai` index sits beside it.
+/// Open the reference FASTA named by `--fasta`. A `.fai` is used only when
+/// the file is uncompressed; a gzipped FASTA is decompressed into memory.
 fn open_sequence_provider(config: &AnnotateConfig) -> Result<Option<Box<dyn SequenceProvider>>> {
     let Some(fasta_path) = config.fasta.as_deref() else {
         return Ok(None);
     };
     Ok({
-        let fai_path = format!("{}.fai", fasta_path);
-        if Path::new(&fai_path).exists() {
-            let reader = fastvep_cache::fasta::MmapFastaReader::open(Path::new(fasta_path))?;
-            eprintln!(
-                "Memory-mapped reference FASTA from {} (using .fai index)",
-                fasta_path
-            );
-            Some(Box::new(
-                fastvep_cache::providers::MmapFastaSequenceProvider::new(reader),
-            ))
-        } else {
-            let fasta_file = File::open(fasta_path)
-                .with_context(|| format!("Opening FASTA file: {}", fasta_path))?;
-            let reader = FastaReader::from_reader(fasta_file)?;
-            eprintln!("Loaded reference FASTA from {}", fasta_path);
-            Some(Box::new(FastaSequenceProvider::new(reader)))
+        match ReferenceFasta::open(Path::new(fasta_path))? {
+            ReferenceFasta::Mapped(reader) => {
+                eprintln!(
+                    "Memory-mapped reference FASTA from {} (using .fai index)",
+                    fasta_path
+                );
+                Some(Box::new(
+                    fastvep_cache::providers::MmapFastaSequenceProvider::new(reader),
+                ))
+            }
+            ReferenceFasta::Loaded {
+                reader,
+                ignored_fai,
+            } => {
+                if ignored_fai {
+                    eprintln!(
+                        "Ignoring {fasta_path}.fai: the FASTA is gzip-compressed, and a .fai addresses the uncompressed file. Loading it into memory."
+                    );
+                }
+                eprintln!("Loaded reference FASTA from {}", fasta_path);
+                Some(Box::new(FastaSequenceProvider::new(reader)))
+            }
         }
     })
 }
@@ -1164,6 +1370,151 @@ fn attach_transcript_sequences(
     needs_seq_build
 }
 
+/// The contigs a run's gene models and reference are about, so that a record on any other is
+/// said to be, and not taken for one in an intergenic region.
+///
+/// A VCF whose contigs are spelled another way than the GFF3's (`Chr10` and `chr10`: `chr1` and `1`
+/// are matched, case is not) used to come out as one `intergenic_variant` row per record, at exit
+/// code 0 and with nothing said, which is also the answer for a variant that is nowhere near a
+/// gene, and reads the same. Ensembl VEP skips such a record and warns (`Chromosome chrZ not found
+/// in annotation sources or synonyms`). This warns in the same way, once for each contig and with a
+/// summary at the end, naming the contig of the run that is the same in another case when there is
+/// one, and goes on as before with the record, because a `--sa-dir` or a variation cache can still
+/// say something about a variant on a contig with no gene model, and VEP has neither. A run in which
+/// not one record is on a known contig, and which has no other source to give it a use, is an error:
+/// a run that annotates nothing is a naming mistake.
+/// How many contigs of a VCF that the run does not know it says so for, one by one; the rest are in
+/// the summary. (A GRCh38 analysis set has thousands of alternate contigs.)
+const CONTIGS_SAID: usize = 10;
+
+struct ContigCheck {
+    known: std::collections::HashSet<String>,
+    /// The contig of the last record and whether it is known: a VCF is mostly runs of one contig,
+    /// and the aliases of a name are not worth building for each record.
+    last: Option<(String, bool)>,
+    unknown: std::collections::BTreeMap<String, u64>,
+    on_known: u64,
+}
+
+impl ContigCheck {
+    fn new(
+        transcripts: &[Transcript],
+        gff3_specs: &[Gff3Spec],
+        seq_provider: Option<&dyn SequenceProvider>,
+    ) -> Self {
+        // The contigs of the gene models, read off the run of transcripts that share one: a `String`
+        // for each of the 500,000 transcripts of the human GFF3, to find the 200 names, was most of
+        // what this cost
+        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut last: Option<&str> = None;
+        for t in transcripts {
+            let chrom: &str = &t.chromosome;
+            if last != Some(chrom) {
+                if !known.contains(chrom) {
+                    known.insert(chrom.to_string());
+                }
+                last = Some(chrom);
+            }
+        }
+        // A tabix read keeps only the transcripts near the input's variants, so the ones it has are
+        // not the contigs the file is about: its index is.
+        for spec in gff3_specs {
+            if Path::new(&format!("{}.tbi", spec.path)).exists() {
+                if let Ok(names) = fastvep_cache::gff::tabix_sequence_names(Path::new(&spec.path)) {
+                    known.extend(names);
+                }
+            }
+        }
+        if let Some(names) = seq_provider.and_then(|sp| sp.sequence_names()) {
+            known.extend(names);
+        }
+        Self {
+            known,
+            last: None,
+            unknown: Default::default(),
+            on_known: 0,
+        }
+    }
+
+    fn is_known(&self, chrom: &str) -> bool {
+        fastvep_core::chrom_aliases(chrom)
+            .iter()
+            .any(|alias| self.known.contains(alias))
+    }
+
+    /// Note a record on `chrom`, and say so, once for the contig and for the first few, if the run
+    /// does not know the contig.
+    fn note(&mut self, chrom: &str) {
+        let known = match &self.last {
+            Some((last, known)) if last == chrom => *known,
+            _ => {
+                let known = self.is_known(chrom);
+                self.last = Some((chrom.to_string(), known));
+                known
+            }
+        };
+        if known {
+            self.on_known += 1;
+            return;
+        }
+        let count = self.unknown.entry(chrom.to_string()).or_default();
+        *count += 1;
+        if *count == 1 && self.unknown.len() <= CONTIGS_SAID {
+            let same_name = self
+                .known
+                .iter()
+                .filter(|k| k.eq_ignore_ascii_case(chrom))
+                .min()
+                .map(|k| format!(" (the gene models and the reference have `{k}`; contig names are case-sensitive)"))
+                .unwrap_or_default();
+            eprintln!(
+                "warning: the VCF has records on `{chrom}`, which is not a contig of the gene models or the reference{same_name}; they are annotated as intergenic"
+            );
+        }
+    }
+
+    /// The summary of a run, and the error of one that annotated nothing: `other_source` is whether
+    /// the run has a `--sa-dir` or a variation cache, which can annotate a variant that no gene
+    /// model reaches.
+    fn finish(&self, other_source: bool) -> Result<()> {
+        if self.unknown.is_empty() {
+            return Ok(());
+        }
+        let list = |names: Vec<(&String, String)>| {
+            let mut shown: Vec<String> = names
+                .iter()
+                .take(8)
+                .map(|(n, extra)| format!("{n}{extra}"))
+                .collect();
+            if names.len() > 8 {
+                shown.push(format!("and {} more", names.len() - 8));
+            }
+            shown.join(", ")
+        };
+        let skipped: u64 = self.unknown.values().sum();
+        let unknown = list(
+            self.unknown
+                .iter()
+                .map(|(n, c)| (n, format!(" ({c})")))
+                .collect(),
+        );
+        if self.on_known == 0 && !other_source {
+            let mut known: Vec<&String> = self.known.iter().collect();
+            known.sort();
+            let known = list(known.into_iter().map(|n| (n, String::new())).collect());
+            return Err(anyhow::anyhow!(
+                "none of the {skipped} records of the VCF is on a contig of the gene models or the reference: \
+                 the VCF has {unknown}, and they have {known}. `chr1` and `1`, and `chrM` and `MT`, are \
+                 matched; case is not. Rename the contigs of one of them."
+            ));
+        }
+        eprintln!(
+            "warning: {skipped} record(s) are on contigs that the gene models and the reference do not have, and were called intergenic: {unknown}"
+        );
+        Ok(())
+    }
+}
+
 pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
     eprintln!("Annotating: {} -> {}", config.input, config.output);
     // Several ACMG criteria read HGVS c. notation rather than raw coordinates:
@@ -1176,6 +1527,15 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
     if config.acmg && !config.hgvs && !config.sa_only {
         config.hgvs = true;
     }
+    // `--cache-dir` is the variation cache, and the known variants are all fastVEP reads from it,
+    // so naming one is asking for them: it is VEP's `--check_existing`, which adds `CLIN_SIG`,
+    // `SOMATIC` and `PHENO` beside `Existing_variation`. VEP needs the flag because its `--cache`
+    // is also the transcript cache; a flag that cannot do anything without a second one would be
+    // a trap here. The frequencies and PubMed ids still need theirs, as in VEP. JSON has no place
+    // for these columns, and a flag the user did not type is not one to warn about.
+    if config.cache_dir.is_some() && !config.sa_only && config.output_format != "json" {
+        config.columns.known.check_existing = true;
+    }
     let config = config;
     let sa_only = config.sa_only;
     if sa_only {
@@ -1184,6 +1544,7 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
                 "--sa-only requires --sa-dir to be set (otherwise there is nothing to emit)."
             ));
         }
+        let pick_switch = config.pick.requested_option();
         for (set, name) in [
             (!config.gff3.is_empty(), "--gff3"),
             (config.fasta.is_some(), "--fasta"),
@@ -1191,7 +1552,21 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
             (config.transcript_cache.is_some(), "--transcript-cache"),
             (config.acmg, "--acmg"),
             (config.hgvs, "--hgvs"),
-            (config.pick, "--pick"),
+            (config.columns.hgvsg, "--hgvsg"),
+            (config.columns.symbol, "--symbol"),
+            (config.columns.biotype, "--biotype"),
+            (config.columns.canonical, "--canonical"),
+            (config.columns.numbers, "--numbers"),
+            (config.columns.variant_class, "--variant-class"),
+            (config.columns.show_ref_allele, "--show-ref-allele"),
+            (config.compat.total_length, "--total-length"),
+            (config.compat.no_escape, "--no-escape"),
+            (config.exclude.predicted, "--exclude-predicted"),
+            (config.exclude.readthrough, "--exclude-readthrough"),
+            (config.exclude.artifact, "--exclude-artifact"),
+            // Names the switch the user actually typed, so the warning is not
+            // about `--pick` when they passed `--flag-pick-allele-gene`.
+            (pick_switch.is_some(), pick_switch.unwrap_or("--pick")),
             (config.proband.is_some(), "--proband"),
             (config.mother.is_some(), "--mother"),
             (config.father.is_some(), "--father"),
@@ -1200,6 +1575,31 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
             if set {
                 eprintln!("warning: --sa-only is set; ignoring {}", name);
             }
+        }
+        for name in config.columns.known.requested() {
+            eprintln!("warning: --sa-only is set; ignoring {}", name);
+        }
+    } else if config.columns.known.checks_existing() && config.cache_dir.is_none() {
+        // The known variants are only in VEP's variation cache. Writing the
+        // columns without it would print `-` for every variant, which reads as
+        // "none of these is known" and is not an answer.
+        return Err(anyhow::anyhow!(
+            "{} read the known variants of VEP's variation cache, and no cache was given. \
+             Pass --cache-dir DIR, the directory with a {{chr}}/all_vars.gz file for each \
+             chromosome (the indexed cache VEP's own `--cache --offline` runs from).",
+            config.columns.known.requested().join(", ")
+        ));
+    }
+
+    // JSON has no place for them: VEP's own JSON carries the known variants in a
+    // `colocated_variants` block that this does not write, and the tab file and the
+    // VCF `CSQ` are where these columns are.
+    if config.output_format == "json" {
+        for name in config.columns.known.requested() {
+            eprintln!(
+                "warning: --output-format json does not carry the known-variant columns; ignoring {}",
+                name
+            );
         }
     }
 
@@ -1266,6 +1666,9 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
     if needs_seq_build && !region_restricted {
         if let Some(ref cp) = cache_path {
             if single_gff3.is_some() || config.transcript_cache.is_some() {
+                // In the order the provider keeps them in, so that a run that loads this cache has
+                // nothing to sort: that was a tenth of the start of a run on the human GFF3
+                fastvep_cache::providers::sort_for_provider(&mut transcripts);
                 if let Err(e) = fastvep_cache::transcript_cache::save_cache(&transcripts, cp) {
                     eprintln!("Warning: could not save cache: {}", e);
                 } else {
@@ -1275,11 +1678,57 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
         }
     }
 
+    // After the sidecar cache is written, and never in the parser: the cache holds the file's
+    // whole transcript set, so a run that leaves some out must not write what it kept as the
+    // cache of the next one, which would not have them.
+    //
+    // Not in `--sa-only`, which loads no transcripts to leave out and has said it ignores the flags:
+    // it would count 0 of 0 and then refuse the run because "every transcript was left out".
+    if config.exclude.any() && !sa_only {
+        let before = transcripts.len();
+        transcripts.retain(|t| !config.exclude.excludes(t));
+        eprintln!(
+            "Left out {} of {} transcripts ({})",
+            before - transcripts.len(),
+            before,
+            [
+                (config.exclude.predicted, "--exclude-predicted"),
+                (config.exclude.readthrough, "--exclude-readthrough"),
+                (config.exclude.artifact, "--exclude-artifact"),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, flag)| *flag)
+            .collect::<Vec<_>>()
+            .join(" "),
+        );
+        if transcripts.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Every transcript was left out by the exclusion flags. Refusing to continue, because \
+                 every variant would be reported as intergenic."
+            ));
+        }
+    }
+
+    let mut contig_check = if sa_only {
+        None
+    } else {
+        Some(ContigCheck::new(
+            &transcripts,
+            &gff3_specs,
+            seq_provider.as_deref(),
+        ))
+    };
+
     let transcript_provider = IndexedTranscriptProvider::new(transcripts);
 
     // Initialize variation provider from VEP cache if provided.
     // Skipped in --sa-only mode (existing_variation comes from defaults).
-    let var_provider: Option<TabixVariationProvider> = if sa_only {
+    //
+    // Skipped for JSON as well, which has no place for what it finds: `--cache-dir` read every variant's
+    // window of the cache and wrote nothing of it.
+    let var_provider: Option<TabixVariationProvider> = if sa_only || config.output_format == "json"
+    {
         None
     } else if let Some(ref dir) = config.cache_dir {
         let info_path = Path::new(dir).join("info.txt");
@@ -1291,6 +1740,7 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
             cache_info.assembly,
             cache_info.variation_cols.len()
         );
+        warn_about_missing_columns(config.columns.known, &cache_info.variation_cols);
         Some(TabixVariationProvider::new(Path::new(dir), &cache_info)?)
     } else {
         None
@@ -1362,6 +1812,10 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
     } else {
         Vec::new()
     };
+
+    if let Some(conflict) = fastvep_annotate::check_sa_assemblies(&sa_providers, &gene_providers) {
+        eprintln!("warning: {conflict}");
+    }
 
     // Load ACMG-AMP classification config if enabled.
     // Skipped in --sa-only mode (ACMG depends on default annotations).
@@ -1442,12 +1896,29 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
         );
     }
 
+    // VEP's own JSON writer makes `cdna_start` and `cdna_end` by splitting the position cell at its
+    // first `-`: with `--total_length` that cell is `5-7/1203`, and the `_end` it keeps is the
+    // start, `5`, because `7/1203` is neither a number nor has a `?`, and a single position is
+    // the string `"5/1203"` for both. Reproducing that would write a wrong end on purpose, so the
+    // totals are left out of JSON, as the warning says. Measured on VEP 116.3 over the edge
+    // fixture's 1,723 cDNA positions: without the flag 1,633 have an end that is not their
+    // start, with it 1,525 of those have the start for an end, and the 90 single positions are
+    // the string `"5/1403"`.
+    if config.compat.total_length && config.output_format == "json" {
+        eprintln!(
+            "warning: --total-length applies to tab and VCF output only; \
+             --output-format json writes its positions as numbers, without it."
+        );
+    }
+
     // Create consequence predictor
     let predictor = ConsequencePredictor::new(config.distance, config.distance);
 
     // Open input VCF (supports plain text or gzipped VCF)
     let input_reader = open_vcf_input_reader(&config.input)?;
-    let mut vcf_parser = VcfParser::new(input_reader)?;
+    // A record that cannot be read is skipped with a message, as Ensembl VEP does, and counted at
+    // the end: one malformed line of a whole-genome VCF is not a reason to lose the run.
+    let mut vcf_parser = VcfParser::new(input_reader)?.lenient();
 
     // Extract sample names from VCF #CHROM header
     let sample_names: Vec<String> = vcf_parser
@@ -1458,7 +1929,7 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
         .unwrap_or_default();
 
     // Open output
-    let output_writer: Box<dyn io::Write> = if config.output == "-" {
+    let output_writer: Box<dyn io::Write + Send> = if config.output == "-" {
         Box::new(io::stdout())
     } else {
         Box::new(
@@ -1508,6 +1979,39 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
         None => DEFAULT_PICK_ORDER.to_vec(),
     };
 
+    // Resolved once, next to the order it will be paired with: the CSQ field
+    // list, the tab header and the per-variant pick all have to agree about
+    // whether this run flags, and deriving each from `config.pick`
+    // independently is how they would come to disagree.
+    let pick_request = config.pick.resolve();
+    // `&& !sa_only` because the run has already told the user it is ignoring
+    // the switch (see the warning above), and `annotate_variant` skips the
+    // pick entirely in that mode. Declaring the column anyway would put a
+    // `PICK` header over a column that is empty on every row, which reads as
+    // "every entry lost the pick" rather than "no pick ran".
+    let pick_flags_column = !sa_only && pick_request.is_some_and(|r| r.needs_pick_column());
+    let mut csq_fields: Vec<&'static str> = output::csq_fields(pick_flags_column, config.columns);
+    // `--sa-only` writes no transcript rows, so there is nothing for the column to
+    // sit on, and a header over a column that no row can fill is the thing the
+    // pick column above is careful not to be.
+    if config.acmg && !sa_only {
+        csq_fields = output::with_acmg_disorders(csq_fields);
+    }
+    // Same reasoning: `--somatic` is ignored under `--sa-only`.
+    if config.somatic && !sa_only {
+        csq_fields = output::with_oncogenicity(csq_fields);
+    }
+    // The optional tab columns, in VEP's order. `--sa-only` writes no transcript
+    // columns at all, and says so for each flag it ignores.
+    let optional_columns: Vec<output::OptionalColumn> = if sa_only {
+        Vec::new()
+    } else {
+        config.columns.columns(config.hgvs)
+    };
+    let csq_options = output::CsqOptions {
+        no_escape: config.compat.no_escape,
+    };
+
     let functional_index = match config.functional_evidence.as_deref() {
         Some(path) => {
             let idx = fastvep_classification::FunctionalEvidenceIndex::from_file(Path::new(path))
@@ -1529,7 +2033,7 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
     let supplementary_specs = output::LoadedSupplementarySpecs::new(&sa_json_keys, &gene_json_keys);
     let owned_vcf_info_ids = output::vcf_owned_info_ids(&supplementary_specs);
     let generated_vcf_headers =
-        output::vcf_info_header_lines(&supplementary_specs, output::DEFAULT_CSQ_FIELDS, sa_only);
+        output::vcf_info_header_lines(&supplementary_specs, &csq_fields, sa_only);
 
     // Write headers based on output format
     match config.output_format.as_str() {
@@ -1554,30 +2058,14 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
             for line in output::tab_supplementary_header_lines(&supplementary_specs) {
                 writeln!(writer, "{}", line)?;
             }
-            let extra_columns = output::tab_supplementary_column_names(&supplementary_specs);
-            let mut header = if sa_only {
-                let mut h = String::from("#Uploaded_variation\tLocation\tAllele");
-                if config.explicit_alleles {
-                    h.push_str("\tREF");
-                }
-                h
-            } else {
-                let mut h = String::from("#Uploaded_variation\tLocation\tAllele");
-                if config.explicit_alleles {
-                    h.push_str("\tREF");
-                }
-                h.push_str(
-                    "\tGene\tFeature\tFeature_type\tConsequence\tcDNA_position\tCDS_position\tProtein_position\tAmino_acids\tCodons\tExisting_variation\tIMPACT\tDISTANCE\tSTRAND\tFLAGS",
-                );
-                h
-            };
-            for col in &extra_columns {
-                header.push('\t');
-                header.push_str(col);
-            }
-            if qc_rules.is_some() {
-                header.push_str("\tQC_CLASS");
-            }
+            let header = output::tab_header(
+                sa_only,
+                config.explicit_alleles,
+                &optional_columns,
+                pick_flags_column,
+                &output::tab_supplementary_column_names(&supplementary_specs),
+                qc_rules.is_some(),
+            );
             writeln!(writer, "{}", header)?;
         }
         "json" => {
@@ -1586,70 +2074,117 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
         _ => {}
     }
 
+    // The bytes a record writes in the format the run asked for.
+    let json = config.output_format == "json";
+    let render_record = |vf: &VariationFeature, text: &mut Vec<u8>| -> Result<()> {
+        match config.output_format.as_str() {
+            "vcf" => write_vcf_line(
+                text,
+                vf,
+                sa_only,
+                &supplementary_specs,
+                &csq_fields,
+                csq_options,
+            )?,
+            "tab" => {
+                // Classify variant against QC rules (if any). The
+                // classifier reads the VCF INFO column once via a
+                // streaming view; no HashMap, no allocation.
+                let qc_label: Option<&str> = if let Some(ref rules) = qc_rules {
+                    let (info_str, qual): (&str, Option<f64>) = match &vf.vcf_fields {
+                        Some(f) => (f.info.as_str(), f.qual.parse::<f64>().ok()),
+                        None => ("", None),
+                    };
+                    let view = fastvep_io::qc::InfoView::new(info_str, qual);
+                    let filter = vf
+                        .vcf_fields
+                        .as_ref()
+                        .map(|f| f.filter.as_str())
+                        .unwrap_or("");
+                    Some(rules.classify(&view, filter))
+                } else {
+                    None
+                };
+
+                let opts = output::TabOptions {
+                    gene_set: gene_set.as_ref(),
+                    explicit_ref: config.explicit_alleles,
+                    qc_class: qc_label,
+                    pick_column: pick_flags_column,
+                    optional: &optional_columns,
+                    no_escape: config.compat.no_escape,
+                };
+                for line in output::format_tab_line_with(vf, &supplementary_specs, sa_only, opts) {
+                    text.extend_from_slice(line.as_bytes());
+                    text.push(b'\n');
+                }
+            }
+            "json" => {
+                let record = output::format_json(vf, sa_only);
+                serde_json::to_writer_pretty(&mut *text, &record)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+
     // Process variants in batches for parallel annotation
     let mut meter = crate::progress::ProgressMeter::new(config.show_progress);
-    let mut first_json = true;
 
-    loop {
+    // The batches are written on a thread of their own, in order, while the next is read and
+    // annotated (see `write_while`).
+    write_while(&mut writer, json, |send| loop {
         // Phase 1: Read a batch of variants (sequential - VCF parser is not Sync)
-        let mut batch: Vec<(VariationFeature, HashMap<String, Vec<MatchedVariant>>)> =
-            Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(VariationFeature, KnownLookup)> = Vec::with_capacity(BATCH_SIZE);
         for _ in 0..BATCH_SIZE {
             match vcf_parser.next_variant()? {
-                Some(mut vf) => {
-                    // Variation lookup (sequential - TabixVariationProvider is not Sync)
-                    let matched_by_allele: HashMap<String, Vec<MatchedVariant>> =
-                        if let Some(ref vp) = var_provider {
-                            let mut by_allele = HashMap::new();
-                            for alt in &vf.alt_alleles {
-                                let alt_str = alt.to_string();
-                                let ref_str = vf.ref_allele.to_string();
-                                let matches = vp
-                                    .get_matched_variants(
-                                        &vf.position.chromosome,
-                                        vf.position.start,
-                                        vf.position.end,
-                                        &ref_str,
-                                        &alt_str,
-                                    )
-                                    .unwrap_or_default();
-                                if !matches.is_empty() {
-                                    by_allele.insert(alt_str, matches);
-                                }
-                            }
-                            by_allele
-                        } else {
-                            HashMap::new()
-                        };
-
-                    // Populate existing_variants on the VF for output access
-                    for matches in matched_by_allele.values() {
-                        for m in matches {
-                            if !vf.existing_variants.iter().any(|kv| kv.name == m.name) {
-                                vf.existing_variants
-                                    .push(fastvep_io::variant::KnownVariant {
-                                        name: m.name.clone(),
-                                        allele_string: None,
-                                        minor_allele: m.minor_allele.clone(),
-                                        minor_allele_freq: m.minor_allele_freq,
-                                        clinical_significance: m.clin_sig.clone(),
-                                        somatic: m.somatic,
-                                        phenotype_or_disease: m.phenotype_or_disease,
-                                        pubmed: m.pubmed.clone(),
-                                        frequencies: m.frequencies.clone(),
-                                    });
-                            }
-                        }
+                Some(vf) => {
+                    if let Some(check) = contig_check.as_mut() {
+                        check.note(&vf.position.chromosome);
                     }
-
-                    batch.push((vf, matched_by_allele));
+                    batch.push((vf, KnownLookup::default()));
                 }
                 None => break,
             }
         }
 
         if batch.is_empty() {
-            break;
+            return Ok(());
+        }
+
+        // Phase 1.2: The known variants of each record, in runs of consecutive records on every
+        // thread. A run reads the cache's files from a place of its own (`cursor`), so that
+        // each carries on through the stretch of a sorted input it was given. With the
+        // annotation spread over the cores this was most of what a run with `--cache-dir` was
+        // left waiting for, on the one thread that reads the VCF: 4,893 of the 6,854 samples of
+        // a one thread run over chr21 and chr22 of HG002 were in the lookup.
+        //
+        // A failed lookup stops the run. It used to be read as "no known
+        // variants", and a variant reported as novel because the cache
+        // could not be read cannot be told from one that is novel. The
+        // SA lookups are counted and reported at the end instead, but they
+        // run inside the parallel loop where an error cannot propagate;
+        // this one can, and the cache has already been validated at
+        // startup, so an error here is a real fault. The error of the first
+        // record that has one is the one reported, whatever the threads were doing.
+        if let Some(ref vp) = var_provider {
+            let run = batch
+                .len()
+                .div_ceil(2 * rayon::current_num_threads())
+                .max(MIN_LOOKUP_RUN);
+            let outcomes: Vec<Result<()>> = batch
+                .par_chunks_mut(run)
+                .map(|records| {
+                    let cursor = vp.cursor();
+                    records.iter_mut().try_for_each(|(vf, known)| {
+                        *known = known_variants(&cursor, vf)?;
+                        Ok(())
+                    })
+                })
+                .collect();
+            for outcome in outcomes {
+                outcome?;
+            }
         }
 
         // Phase 1.5: Preload SA providers for this batch (sequential)
@@ -1684,79 +2219,54 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
             functional_evidence,
             oncogenicity_config: oncogenicity_config.as_ref(),
             pick_order: &pick_order,
+            pick: pick_request,
             sample_names: &sample_names,
             normalize_gnomad_queries,
             repeat_db_loaded,
         };
-        // Phase 2: Annotate batch in parallel (transcript lookup + consequence prediction + HGVS)
-        batch
-            .par_iter_mut()
-            .for_each(|(vf, matched_by_allele)| annotate_variant(&ctx, vf, matched_by_allele));
+        // Phase 2: Annotate the batch (transcript lookup + consequence prediction + HGVS) and
+        // render it into the bytes it writes, in one pass on every thread (see `render_batch`).
+        //
+        // A step that has to see every record annotated before any is rendered cannot share that
+        // pass, and that is the compound-het enrichment of a trio: its batch is annotated first, in
+        // a pass of its own, and `render_batch` then only renders.
+        let trio = acmg_config.as_ref().filter(|c| c.trio.is_some());
+        if let Some(acmg_cfg) = trio {
+            batch
+                .par_iter_mut()
+                .for_each(|(vf, known)| annotate_variant(&ctx, vf, known));
 
-        // Phase 2.5: Compound-het enrichment pass (sequential, after parallel annotation)
-        if let Some(ref acmg_cfg) = acmg_config {
-            if acmg_cfg.trio.is_some() {
-                let mut vfs: Vec<&mut VariationFeature> =
-                    batch.iter_mut().map(|(vf, _)| vf).collect();
-                enrich_compound_het_batch(
-                    &mut vfs,
-                    acmg_cfg,
-                    &sample_names,
-                    functional_evidence,
-                    repeat_db_loaded,
-                );
-            }
+            // Phase 2.5: Compound-het enrichment pass (sequential, after parallel annotation)
+            let mut vfs: Vec<&mut VariationFeature> = batch.iter_mut().map(|(vf, _)| vf).collect();
+            enrich_compound_het_batch(
+                &mut vfs,
+                acmg_cfg,
+                &sample_names,
+                functional_evidence,
+                repeat_db_loaded,
+            );
+        }
+        let records = batch.len() as u64;
+        let pieces = render_batch(
+            batch,
+            json,
+            |(vf, known)| {
+                if trio.is_none() {
+                    annotate_variant(&ctx, vf, known);
+                }
+            },
+            |(vf, _), text| render_record(vf, text),
+        );
+
+        // Phase 3: Hand the batch to the writer, which writes the batches in the order they come
+        // (preserving VCF order). A writer that has stopped has failed, and says so when it is
+        // joined: there is nothing more to produce for it.
+        if !send(pieces) {
+            return Ok(());
         }
 
-        // Phase 3: Write output sequentially (preserves VCF order)
-        for (vf, _) in &batch {
-            match config.output_format.as_str() {
-                "vcf" => write_vcf_line(&mut writer, vf, sa_only, &supplementary_specs)?,
-                "tab" => {
-                    // Classify variant against QC rules (if any). The
-                    // classifier reads the VCF INFO column once via a
-                    // streaming view; no HashMap, no allocation.
-                    let qc_label: Option<&str> = if let Some(ref rules) = qc_rules {
-                        let (info_str, qual): (&str, Option<f64>) = match &vf.vcf_fields {
-                            Some(f) => (f.info.as_str(), f.qual.parse::<f64>().ok()),
-                            None => ("", None),
-                        };
-                        let view = fastvep_io::qc::InfoView::new(info_str, qual);
-                        let filter = vf
-                            .vcf_fields
-                            .as_ref()
-                            .map(|f| f.filter.as_str())
-                            .unwrap_or("");
-                        Some(rules.classify(&view, filter))
-                    } else {
-                        None
-                    };
-
-                    let opts = output::TabOptions {
-                        gene_set: gene_set.as_ref(),
-                        explicit_ref: config.explicit_alleles,
-                        qc_class: qc_label,
-                    };
-                    for line in
-                        output::format_tab_line_with(vf, &supplementary_specs, sa_only, opts)
-                    {
-                        writeln!(writer, "{}", line)?;
-                    }
-                }
-                "json" => {
-                    if !first_json {
-                        writeln!(writer, ",")?;
-                    }
-                    first_json = false;
-                    let json = output::format_json(vf, sa_only);
-                    write!(writer, "{}", serde_json::to_string_pretty(&json)?)?;
-                }
-                _ => {}
-            }
-        }
-
-        meter.update_n(batch.len() as u64);
-    } // end batch loop
+        meter.update_n(records);
+    })?; // end batch loop
 
     // Close JSON array
     if config.output_format == "json" {
@@ -1768,9 +2278,658 @@ pub fn run_annotate(mut config: AnnotateConfig) -> Result<()> {
     // After the meter, so a run that lost annotations says so last and the
     // warning is not buried in progress output.
     fastvep_annotate::report_sa_lookup_errors();
+    fastvep_annotate::report_ref_mismatches();
+    if let Some(note) = var_provider.as_ref().and_then(|vp| vp.finish()) {
+        eprintln!("{note}");
+    }
+    if vcf_parser.skipped() > 0 {
+        eprintln!(
+            "warning: {} record(s) of the VCF could not be read and were not annotated (the first are named above)",
+            vcf_parser.skipped()
+        );
+    }
+    if let Some(check) = &contig_check {
+        check.finish(!sa_providers.is_empty() || var_provider.is_some())?;
+    }
 
+    release_in_background(transcript_provider);
     Ok(())
 }
+
+/// Annotates a batch, renders it into the bytes it writes, and lets each record go, in one pass
+/// over the records on every thread.
+///
+/// A record is annotated, rendered and freed by the one thread that takes it. (It was made by the
+/// VCF parser, on the thread that reads; what is made on the thread that annotates it is the
+/// hundreds of small allocations of its rows.) The batch is not left to be freed by the thread that
+/// reads the VCF, which is what this used to do after a pass to annotate and a pass to render: one
+/// thread freeing the rows of 1,024 variants while the rest waited for the next batch was 11 to 13%
+/// of the time of a batch of HG002 chr1 at 8 threads, on macOS and on Linux.
+///
+/// Freeing them on every thread after the rendering, instead, did not help with glibc: no faster
+/// and more CPU time, most likely because each thread is then freeing what other threads allocated.
+/// Rows that are made and freed by one thread took 11 to 13% off a whole run on Linux, at 1 and at
+/// 8 threads, and 6 to 8% on macOS (100,000 records of HG002 chr1 with the flags of #166, the
+/// output the same bytes). That it is faster on one thread as well says it is less work and not
+/// only less waiting, which looks like the cache: the record is rendered while what annotating it
+/// touched is still in it.
+///
+/// `annotate` is for the caller that has not annotated the batch yet; a caller that has (a trio,
+/// whose compound-het enrichment has to see the whole batch annotated first) passes one that does
+/// nothing. Each piece is the text of a run of consecutive records, so the pieces in order are the
+/// file the records would have made written one by one. A record that fails to render fails its
+/// piece, which the writer reports in order, and the records after it are still annotated.
+fn render_batch<T, A, R>(batch: Vec<T>, json: bool, annotate: A, render: R) -> Vec<Result<Vec<u8>>>
+where
+    T: Send,
+    A: Fn(&mut T) + Sync,
+    R: Fn(&T, &mut Vec<u8>) -> Result<()> + Sync,
+{
+    batch
+        .into_par_iter()
+        .fold(
+            || Ok(Vec::new()),
+            |piece: Result<Vec<u8>>, mut record| {
+                annotate(&mut record);
+                let mut text = piece?;
+                if json && !text.is_empty() {
+                    text.extend_from_slice(b",\n");
+                }
+                render(&record, &mut text)?;
+                Ok(text)
+            },
+        )
+        .collect()
+}
+
+/// Runs `produce`, which sends the pieces of each batch to be written as it makes them, while a
+/// thread of its own writes the batches already sent, in order.
+///
+/// A batch used to be written by the thread that had read it, once the pool had annotated it, and
+/// the pool's threads did nothing meanwhile: with `--distance 500000` a batch is megabytes. Now the
+/// next batch is read and annotated while it is written. The hand-over has no room in it, so that a
+/// batch that is finished waits for the writer to be done with the one before, and a writer slower
+/// than the annotation stops it, as it always did.
+///
+/// `send` returns `false` once the writer has stopped, which it does at its first error; `produce`
+/// then has nothing more to do. An error of the writer is returned in preference to one of `produce`:
+/// the writer can only have failed on a batch that came before whatever `produce` met, and a
+/// failure that comes first is the one a run that wrote as it went would have reported.
+///
+/// Three things are not as they were when one thread did both:
+/// - The producer learns that the writer has failed at its next `send`, so it finishes the batch it
+///   is on first, which a run that wrote as it went would not have been on: a closed pipe or a
+///   full disk stops the run one batch later, and an error that batch meets (a failed read, a failed
+///   lookup) is not reported, because the writer's came first.
+/// - The writer is a thread of its own, outside rayon's pool, so `RAYON_NUM_THREADS=N` bounds the
+///   annotating threads and not the threads of the process: this one is a thread that writes.
+/// - A message the producer prints to stderr (a progress line, the warning for a record that could
+///   not be read) is no longer printed between two writes of the one thread. With stdout and
+///   stderr the same pipe (`-o - 2>&1`) it can land inside a line of the output, where it fell
+///   between lines before. Output that is meant to be read as the VCF was never safe to merge with
+///   stderr, which carries the `Annotating:` line from the start.
+fn write_while<W: Write + Send>(
+    writer: &mut W,
+    json: bool,
+    produce: impl FnOnce(&mut dyn FnMut(Vec<Result<Vec<u8>>>) -> bool) -> Result<()>,
+) -> Result<()> {
+    std::thread::scope(|scope| {
+        let (batches, written) = std::sync::mpsc::sync_channel(0);
+        let writing = std::thread::Builder::new()
+            .name("write".into())
+            .spawn_scoped(scope, || write_pieces(writer, written, json))
+            .context("Starting the thread that writes the output")?;
+        let produced = produce(&mut |pieces| batches.send(pieces).is_ok());
+        drop(batches);
+        match writing.join() {
+            Ok(Err(written)) => Err(written),
+            Ok(Ok(())) => produced,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// Write the pieces of each batch received, in the order they come: a piece that holds text, and
+/// between the texts of a JSON run the comma of the array.
+///
+/// A piece that failed to render ends the writing at that piece, after every piece before it
+/// was written, as the pieces were once written in a loop that returned at it.
+fn write_pieces(
+    writer: &mut impl Write,
+    batches: std::sync::mpsc::Receiver<Vec<Result<Vec<u8>>>>,
+    json: bool,
+) -> Result<()> {
+    let mut first_json = true;
+    for pieces in batches {
+        for piece in pieces {
+            let text = piece?;
+            if text.is_empty() {
+                continue;
+            }
+            if json {
+                if !first_json {
+                    writeln!(writer, ",")?;
+                }
+                first_json = false;
+            }
+            writer.write_all(&text)?;
+        }
+    }
+    Ok(())
+}
+
+/// Frees `value` on a thread of its own, which nothing waits for.
+///
+/// The transcript models are most of the heap of a run: hundreds of thousands of transcripts of a
+/// few dozen small allocations each, and freeing them one at a time on the way out was about a
+/// second of CPU on the human GFF3, for a process that hands all of it back in the next moment. That
+/// is a fifth of a run of 130,000 records and a third of one of 20,000. A thread still freeing when
+/// `main` returns ends with the process, which is the point; one that finishes first has freed what
+/// it was given, so a caller that runs `run_annotate` again in the same process (the tests do)
+/// leaks nothing. If no thread can be made, the closure is dropped where it stands.
+fn release_in_background<T: Send + 'static>(value: T) {
+    let _ = std::thread::Builder::new()
+        .name("release".into())
+        .spawn(move || drop(value));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{release_in_background, render_batch, write_while};
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    /// A value that says on which thread it was dropped, once it has been let go.
+    struct Held {
+        permit: mpsc::Receiver<()>,
+        dropped_on: mpsc::Sender<std::thread::ThreadId>,
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            // Waits for the test to say go, so that a drop in the caller's own thread would hold
+            // the call up until the wait ran out
+            let _ = self.permit.recv_timeout(Duration::from_secs(5));
+            let _ = self.dropped_on.send(std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn a_value_is_dropped_on_another_thread_and_the_call_does_not_wait_for_it() {
+        let (go, permit) = mpsc::channel();
+        let (dropped_on, dropped) = mpsc::channel();
+        let started = std::time::Instant::now();
+        release_in_background(Held { permit, dropped_on });
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the call waited for the drop: {:?}",
+            started.elapsed()
+        );
+        go.send(()).unwrap();
+        let thread = dropped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the value is dropped");
+        assert_ne!(thread, std::thread::current().id());
+    }
+
+    /// Where each stage of a record's life happened, in the order it happened: the record, the
+    /// stage, and the thread.
+    type Stages = Arc<Mutex<Vec<(usize, &'static str, std::thread::ThreadId)>>>;
+
+    /// A record that notes the thread it is annotated, rendered and dropped on.
+    struct Probe {
+        id: usize,
+        stages: Stages,
+    }
+
+    impl Probe {
+        fn note(&self, stage: &'static str) {
+            self.stages
+                .lock()
+                .unwrap()
+                .push((self.id, stage, std::thread::current().id()));
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.note("dropped");
+        }
+    }
+
+    fn probes(n: usize, stages: &Stages) -> Vec<Probe> {
+        (0..n)
+            .map(|id| Probe {
+                id,
+                stages: Arc::clone(stages),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_record_is_annotated_rendered_and_dropped_on_one_thread_and_that_is_not_the_callers() {
+        const RECORDS: usize = 4_000;
+        let stages: Stages = Arc::default();
+        render_batch(
+            probes(RECORDS, &stages),
+            false,
+            |p| p.note("annotated"),
+            |p, text| {
+                p.note("rendered");
+                text.push(b'x');
+                Ok(())
+            },
+        );
+
+        // Not the caller's thread: the batch is the reading thread's, and its freeing is what a
+        // pass to annotate and a pass to render left to it.
+        let caller = std::thread::current().id();
+        let mut by_record: HashMap<usize, Vec<(&str, std::thread::ThreadId)>> = HashMap::new();
+        for (id, stage, thread) in stages.lock().unwrap().iter() {
+            by_record.entry(*id).or_default().push((stage, *thread));
+        }
+        assert_eq!(by_record.len(), RECORDS);
+        for (id, events) in &by_record {
+            let order: Vec<&str> = events.iter().map(|e| e.0).collect();
+            assert_eq!(order, ["annotated", "rendered", "dropped"], "record {id}");
+            let thread = events[0].1;
+            assert!(
+                events.iter().all(|e| e.1 == thread),
+                "record {id} changed threads: {events:?}"
+            );
+            assert_ne!(thread, caller, "record {id} was handled by the caller");
+        }
+    }
+
+    #[test]
+    fn the_pieces_in_order_are_the_file_the_records_would_have_made_written_one_by_one() {
+        let pieces = render_batch(
+            (0..10_000).collect::<Vec<usize>>(),
+            false,
+            |_| {},
+            |n, text| {
+                text.extend_from_slice(format!("{n}\n").as_bytes());
+                Ok(())
+            },
+        );
+        let written: Vec<u8> = pieces.into_iter().flat_map(|p| p.unwrap()).collect();
+        let one_by_one: String = (0..10_000).map(|n| format!("{n}\n")).collect();
+        assert_eq!(String::from_utf8(written).unwrap(), one_by_one);
+    }
+
+    #[test]
+    fn json_records_are_separated_inside_a_piece_and_the_writer_separates_the_pieces() {
+        let pieces = render_batch(
+            (0..5_000).collect::<Vec<usize>>(),
+            true,
+            |_| {},
+            |n, text| {
+                text.extend_from_slice(format!("{{{n}}}").as_bytes());
+                Ok(())
+            },
+        );
+        // The writer puts `,\n` between the pieces that have text.
+        let mut sink = Sink::default();
+        write_while(&mut sink, true, |send| {
+            assert!(send(pieces));
+            Ok(())
+        })
+        .unwrap();
+        let one_by_one = (0..5_000)
+            .map(|n| format!("{{{n}}}"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        assert_eq!(String::from_utf8(sink.bytes).unwrap(), one_by_one);
+    }
+
+    /// An output that notes the threads it was written from, and can fail at a given write.
+    #[derive(Default)]
+    struct Sink {
+        bytes: Vec<u8>,
+        threads: std::collections::HashSet<std::thread::ThreadId>,
+        writes: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if Some(self.writes) == self.fail_at {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.threads.insert(std::thread::current().id());
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn text(s: &str) -> anyhow::Result<Vec<u8>> {
+        Ok(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn batches_are_written_in_the_order_they_are_sent_on_a_thread_that_is_not_the_producers() {
+        let mut sink = Sink::default();
+        write_while(&mut sink, false, |send| {
+            for batch in 0..40 {
+                assert!(send(
+                    (0..3)
+                        .map(|piece| text(&format!("{batch}.{piece}\n")))
+                        .collect()
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let expected: String = (0..40)
+            .flat_map(|b| (0..3).map(move |p| format!("{b}.{p}\n")))
+            .collect();
+        assert_eq!(String::from_utf8(sink.bytes).unwrap(), expected);
+        assert_eq!(sink.threads.len(), 1);
+        assert!(!sink.threads.contains(&std::thread::current().id()));
+    }
+
+    #[test]
+    fn json_pieces_are_separated_across_batches_and_an_empty_piece_is_left_out() {
+        let mut sink = Sink::default();
+        write_while(&mut sink, true, |send| {
+            assert!(send(vec![text("{1}"), text("")]));
+            assert!(send(vec![text("{2},\n{3}")]));
+            assert!(send(vec![text("")]));
+            assert!(send(vec![text("{4}")]));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(sink.bytes).unwrap(),
+            "{1},\n{2},\n{3},\n{4}"
+        );
+    }
+
+    #[test]
+    fn a_piece_that_failed_to_render_ends_the_writing_there_and_is_the_error() {
+        let mut sink = Sink::default();
+        let result = write_while(&mut sink, false, |send| {
+            send(vec![text("a"), Err(anyhow::anyhow!("render")), text("c")]);
+            // the writer has stopped, so this one is refused
+            while send(vec![text("d")]) {}
+            Ok(())
+        });
+        assert_eq!(sink.bytes, b"a");
+        assert_eq!(result.unwrap_err().to_string(), "render");
+    }
+
+    #[test]
+    fn a_writer_that_fails_stops_the_producer_and_its_error_is_the_one_returned() {
+        let mut sink = Sink {
+            fail_at: Some(2),
+            ..Default::default()
+        };
+        let mut sent = 0;
+        let result = write_while(&mut sink, false, |send| {
+            for _ in 0..1_000 {
+                if !send(vec![text("x")]) {
+                    break;
+                }
+                sent += 1;
+            }
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().to_string(), "disk full");
+        assert!(sent < 10, "the producer went on for {sent} batches");
+    }
+
+    #[test]
+    fn an_error_of_the_writer_comes_before_one_of_the_producer_that_came_after_it() {
+        // The writer can only have failed on a batch that came before whatever the producer
+        // met afterwards, and the first failure is the one a run that wrote as it went reported.
+        let mut sink = Sink {
+            fail_at: Some(1),
+            ..Default::default()
+        };
+        let result = write_while(&mut sink, false, |send| {
+            while send(vec![text("x")]) {}
+            Err(anyhow::anyhow!("producer"))
+        });
+        assert_eq!(result.unwrap_err().to_string(), "disk full");
+    }
+
+    #[test]
+    fn an_error_of_the_producer_leaves_every_batch_before_it_written() {
+        let mut sink = Sink::default();
+        let result = write_while(&mut sink, false, |send| {
+            assert!(send(vec![text("a")]));
+            assert!(send(vec![text("b")]));
+            Err(anyhow::anyhow!("read error"))
+        });
+        assert_eq!(sink.bytes, b"ab");
+        assert_eq!(result.unwrap_err().to_string(), "read error");
+    }
+
+    /// An output that holds its first write until it is let go.
+    struct HeldOnce {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        held: bool,
+    }
+
+    impl Write for HeldOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if !self.held {
+                self.held = true;
+                let _ = self.started.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_producer_cannot_hand_over_a_second_batch_while_the_writer_is_held_on_the_first() {
+        // The hand-over has no room in it: with the first batch in the writer's hands and the
+        // writer held, the second batch is made and not taken, which bounds what is in memory.
+        //
+        // Nothing here depends on how fast a thread runs. The producer says that it is about to
+        // send the second batch before it does, so by the time the test looks the producer is at
+        // that send or past it; and the count it looks at can only be more than one if the send
+        // returned, which with the writer held is the bound broken, and not a slow thread.
+        let (started, writer_is_writing) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (about_to_send, producer_is_at) = mpsc::channel();
+        let mut slow = HeldOnce {
+            started,
+            release: released,
+            held: false,
+        };
+        let sent = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let sent = &sent;
+            let watcher = scope.spawn(move || {
+                writer_is_writing
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the writer starts on the first batch");
+                assert_eq!(
+                    producer_is_at
+                        .iter()
+                        .take(2)
+                        .last()
+                        .expect("the producer reaches its second send"),
+                    1
+                );
+                // a producer that is not held back has the time to send the others
+                std::thread::sleep(Duration::from_millis(100));
+                let ahead = sent.load(std::sync::atomic::Ordering::SeqCst);
+                release.send(()).unwrap();
+                ahead
+            });
+            write_while(&mut slow, false, |send| {
+                for batch in 0..5 {
+                    let _ = about_to_send.send(batch);
+                    assert!(send(vec![text("x")]));
+                    sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            })
+            .unwrap();
+            // one in the writer's hands, and the producer waiting to hand over the next
+            assert_eq!(watcher.join().unwrap(), 1);
+        });
+    }
+
+    /// An output that panics at its first write.
+    struct PanicsOnWrite;
+
+    impl Write for PanicsOnWrite {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("the writer panicked on purpose")
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_panic_of_the_writer_is_the_callers_and_the_producer_is_let_go() {
+        let mut sent = 0;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_while(&mut PanicsOnWrite, false, |send| {
+                // a writer that has panicked has gone, and `send` says so, or this would not end
+                while send(vec![text("x")]) {
+                    sent += 1;
+                }
+                Ok(())
+            })
+        }));
+        let payload = outcome.expect_err("the panic of the writer is resumed in the caller");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("the writer panicked on purpose")
+        );
+        assert!(sent < 10, "the producer went on for {sent} batches");
+    }
+
+    #[test]
+    fn a_record_that_fails_to_render_fails_its_piece_and_the_others_are_still_annotated_and_dropped(
+    ) {
+        let stages: Stages = Arc::default();
+        let pieces = render_batch(
+            probes(1_000, &stages),
+            false,
+            |p| p.note("annotated"),
+            |p, _| {
+                if p.id == 500 {
+                    anyhow::bail!("record 500")
+                }
+                Ok(())
+            },
+        );
+
+        let failed: Vec<String> = pieces
+            .iter()
+            .filter_map(|p| p.as_ref().err().map(|e| e.to_string()))
+            .collect();
+        assert_eq!(failed, ["record 500"]);
+        let stages = stages.lock().unwrap();
+        let count = |stage: &str| stages.iter().filter(|s| s.1 == stage).count();
+        assert_eq!(count("annotated"), 1_000);
+        assert_eq!(count("dropped"), 1_000);
+    }
+}
+
+/// Say so when the cache has none of the columns a flag asks for.
+///
+/// VEP answers with empty columns and says nothing, and so does this, because
+/// that is what a script that works against VEP expects; but an empty `gnomADg_AF`
+/// column over a cache that never had the data reads as "no variant is in gnomAD",
+/// so the run says it once, here, where the cache is opened.
+fn warn_about_missing_columns(known: fastvep_io::known::KnownFlags, variation_cols: &[String]) {
+    let has = |name: &str| variation_cols.iter().any(|c| c == name);
+    for group in &fastvep_io::known::FREQUENCY_GROUPS {
+        if known.group(group.flag) && !group.keys.iter().any(|k| has(k.key)) {
+            eprintln!(
+                "warning: --{} asks for {} frequencies, and this cache's variation_cols has none \
+                 of their columns ({}): they will be empty for every variant, as VEP writes them.",
+                group.flag.replace('_', "-"),
+                group.description,
+                group
+                    .keys
+                    .iter()
+                    .map(|k| k.key)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    if known.pubmed && !has("pubmed") {
+        eprintln!(
+            "warning: --pubmed asks for PUBMED, and this cache's variation_cols has no `pubmed` \
+             column: it will be empty for every variant, as VEP writes it."
+        );
+    }
+}
+
+/// What the variation cache attached to one input record.
+#[derive(Default)]
+struct KnownLookup {
+    /// The alt alleles the lookup was made with, symbolic ones and `*` left out:
+    /// `AlleleMatch::alt_index` of the site counts into this list.
+    alleles: Vec<Allele>,
+    /// The known variants of each alt allele as the rows write it, in the order
+    /// VEP prints `Existing_variation`.
+    by_allele: HashMap<String, Vec<MatchedVariant>>,
+    /// Every known variant attached to the record, in cache order, with the
+    /// alleles each matched: what VEP's frequency columns are computed from.
+    site: KnownSite,
+}
+
+/// The known variants VEP's `--check_existing` reports for one input record.
+///
+/// VEP leaves structural variants out of the check
+/// (`VariationTabix::annotate_InputBuffer` keeps only plain
+/// `VariationFeature`s), and a symbolic or missing allele has no sequence to
+/// compare, so neither is looked up. Without the first rule a large `END=` would
+/// read every cache record under the span.
+fn known_variants(provider: &impl VariationProvider, vf: &VariationFeature) -> Result<KnownLookup> {
+    if vf.variant_type.is_structural() {
+        return Ok(KnownLookup::default());
+    }
+    let alleles: Vec<Allele> = vf
+        .alt_alleles
+        .iter()
+        .filter(|a| !matches!(a, Allele::Missing | Allele::Symbolic(_)))
+        .cloned()
+        .collect();
+    if alleles.is_empty() {
+        return Ok(KnownLookup::default());
+    }
+    let alts: Vec<String> = alleles.iter().map(ToString::to_string).collect();
+    let site = provider.known_site(
+        &vf.position.chromosome,
+        vf.position.start,
+        vf.position.end,
+        &vf.ref_allele.to_string(),
+        &alts,
+    )?;
+    let by_allele = alts
+        .into_iter()
+        .zip(site.per_alt(alleles.len()))
+        .filter(|(_, matches)| !matches.is_empty())
+        .collect();
+    Ok(KnownLookup {
+        alleles,
+        by_allele,
+        site,
+    })
+}
+
 /// Extract trio genotype information from a VariationFeature's VCF sample columns (CLI path).
 fn extract_trio_genotypes_cli(
     vf: &VariationFeature,
@@ -2024,8 +3183,7 @@ fn enrich_compound_het_batch(
                 aa.amino_acids.as_ref(),
                 aa.protein_position.map(|(s, _)| s),
                 aa.hgvsc.as_deref(),
-                aa.intron_offset,
-                aa.shifted_intron_offset,
+                aa.splice,
                 aa.exon,
                 aa.protein_length,
                 aa.escapes_nmd,
@@ -2064,12 +3222,14 @@ fn write_vcf_line(
     vf: &VariationFeature,
     sa_only: bool,
     specs: &output::LoadedSupplementarySpecs,
+    csq_fields: &[&str],
+    csq_options: output::CsqOptions,
 ) -> Result<()> {
     if let Some(ref fields) = vf.vcf_fields {
         let csq = if sa_only {
             String::new()
         } else {
-            output::format_csq(vf, output::DEFAULT_CSQ_FIELDS)
+            output::format_csq_with(vf, csq_fields, csq_options)
         };
         let info = output::format_vcf_info_fields(&fields.info, vf, &csq, specs);
 

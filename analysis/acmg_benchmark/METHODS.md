@@ -8,6 +8,11 @@ Group refinements, producing a 5-tier classification: Pathogenic (P),
 Likely Pathogenic (LP), Uncertain Significance (VUS), Likely Benign (LB),
 Benign (B).
 
+**A note on the word "truth".**
+The benchmark compares fastVEP with ClinVar's own 2-star-and-better classifications.
+That is a reference, not ground truth: ClinVar's classifications can rest on the same kinds of evidence fastVEP computes (frequency, computational prediction, consequence), so agreement is partly circular, and a disagreement can as well be ClinVar being out of date or fastVEP being wrong.
+Older text in this document, and the `truth` column in older result files, mean ClinVar's classification and nothing stronger; the scripts accept both the old and the new file and column names.
+
 This document reflects the state after the SVI alignment series (PR1–PR10).
 Each criterion section includes the ClinGen reference and any deviations
 from a strict reading of the SVI text. A per-criterion "Limitations"
@@ -33,7 +38,7 @@ that drove each call in `details.pp3_source` / `details.ps1_path` /
 | PS3 | Strong | Functional studies | Not automatable — NotEvaluated |
 | PS4 | Strong | Prevalence in affected vs controls | **NotEvaluated by default** — requires case-control statistics. Optional legacy proxy via `use_clinvar_stars_as_ps4_proxy` |
 | PM1 | Moderate | Mutational hotspot / functional domain | ClinVar protein-position density. Capped against PP3 per Pejaver 2022 |
-| PM2 | Supporting* | Absent / extremely rare in population | gnomAD raw AF, **inheritance-aware** (AD/unknown: AC=0; AR: AF ≤ 0.00007) — SVI v1.0 |
+| PM2 | Supporting* | Absent / extremely rare in population | gnomAD raw AF, **inheritance-aware** (not recessive-only: AF ≤ 0.00004; recessive-only: AF ≤ 0.00007, which equals the Hearing Loss VCEP's recessive bar; SVI PM2 v1.0 gives no frequency) |
 | PM3 | Supporting/Moderate/Strong/VeryStrong | In trans with pathogenic (recessive) | **SVI PM3 v1.0 points-based**: P / LP companion × phasing × hom-occurrence → 0.5 / 1.0 / 2.0 / 4.0 thresholds |
 | PM4 | Moderate | Protein length change | Consequence (in-frame indel, stop-loss) |
 | PM5 | Moderate | Novel missense at known pathogenic position | ClinVar protein-position index (different alt AA) |
@@ -49,9 +54,9 @@ that drove each call in `details.pp3_source` / `details.ps1_path` /
 
 | Criterion | Strength | Description | Data Source / Notes |
 |-----------|----------|-------------|---------------------|
-| BA1 | Standalone | Common variant (AF > 5%) | gnomAD max population AF, with **AN ≥ 2000** minimum (gnomAD v4 / SVI March 2024). Honors the **curated frequency-exception list** - Ghosh 2018's nine plus three hypomorphic alleles, the latter blocking BS1 and BS2 as well |
+| BA1 | Standalone | Common variant (AF > 5%) | gnomAD max population AF, with **AN ≥ 2000** at the site (the dataset-size condition of the BA1 recommendation, Ghosh 2018, applied to the site's AN; the March 2024 gnomAD v4 communication states no floor). Honors the **curated frequency-exception list** - Ghosh 2018's nine, three hypomorphic alleles that also block BS1 and BS2, and three more the round-6 review named (G6PD x2, SERPINC1) that do the same |
 | BS1 | Strong | Greater than expected frequency | gnomAD **max-population AF** (mirrors BA1; was cohort `all_af` pre-v7); gene-specific or default 0.01; same AN minimum as BA1 |
-| BS2 | Strong | Observed in healthy adults | gnomAD homozygote count + ClinGen GDV inheritance (or OMIM legacy). For AD-only genes: AC ≥ 5 (default; configurable via `bs2_ad_min_ac`). |
+| BS2 | Strong | Observed in healthy adults | gnomAD counts + ClinGen GDV inheritance (or OMIM legacy). Both branches hold a 95 % lower bound on the frequency of the individuals the disorder would affect against a prevalence bar. Dominant genes: carriers (`AC - nhomalt`) with AC ≥ 5 (`bs2_ad_min_ac`) and a bound above `bs2_ad_prevalence_threshold` (3e-4). Recessive and X-linked genes: individuals with no functional copy, with a bound above `bs2_hom_prevalence_threshold` (1e-3). Not evaluated without an AN, or with an AN of 0. |
 | BS3 | Strong | Functional studies — no damage | Not automatable — NotEvaluated |
 | BS4 | Strong | Lack of segregation | Not automatable — NotEvaluated |
 | BP1 | Supporting | Missense in truncation-disease gene | gnomAD pLI ≥ 0.9 + misZ < 2.0 |
@@ -112,18 +117,20 @@ When NMD prediction or other transcript-level signals are missing,
 PVS1 falls back to legacy full-strength VeryStrong for backward
 compatibility.
 
-### PM2 Inheritance-Aware Threshold (SVI v1.0)
+### PM2 Inheritance-Aware Bars (not from SVI PM2 v1.0, which sets only the strength)
 
-| Inheritance | Threshold |
-|-------------|-----------|
-| AD / unknown | Strict absence (AC = 0 AND AF = 0) |
-| AR | AF ≤ 0.00007 (0.007%) |
+| Inheritance | Bar |
+|-------------|-----|
+| Not recessive-only (AD, both, unknown) | AF ≤ 0.00004 (set at v10 by a sweep under the 2015 table; nearly flat under the point system) |
+| Recessive-only | AF ≤ 0.00007 (0.007%; swept for the ACMG manuscript: flat) |
 | Per-gene override | Wins over inheritance default |
 
-Uses **raw** gnomAD AF (not FAF / popmax). Inheritance is inferred from
-ClinGen Gene-Disease Validity (preferred per Abou Tayoun 2018) or OMIM
-`genemap2.txt` (legacy). Both populate the same `omim` json_key in the
-`.oga` schema.
+Uses **raw** gnomAD AF (not FAF / popmax).
+Inheritance is read from ClinGen Gene-Disease Validity (preferred per Abou Tayoun 2018) or OMIM `genemap2.txt` (legacy).
+Both populate the same `omim` json_key in the `.oga` schema.
+For a ClinGen curation it is the curated mode of inheritance (`AD`, `AR`, `XL`, `SD`, `MT`, `UD`) that the phenotype string carries in its `(ClinGen <classification>/<MOI>, <MONDO>)` tag; for an OMIM phenotype, which has no tag, it is the words of the phenotype.
+Until v38 the tag was ignored and the words were read for ClinGen's phenotypes as well, so that a gene curated as AR whose disease name did not say so was read as having no inheritance (`docs/ACMG.md`, limitation 20).
+A gene whose established diseases fall under more than one mode of inheritance is also classified against each (`per_disorder` in the JSON, `ACMG_DISORDERS` in the CSQ).
 
 ### PM3 v1.0 Points Scoring (SVI)
 
@@ -163,26 +170,42 @@ VCEPs can extend.
 | MEFV | c.1223G>A | VUS |
 | PIBF1 | c.1214G>A | VUS |
 
-### Anti-Double-Counting (PP3 Reconciliation)
+### Anti-Double-Counting (Reconciliation)
 
-A post-evaluation reconciliation pass suppresses PP3 (or PM1) under
-overlap conditions called out in Pejaver 2022 and Walker 2023:
+A post-evaluation reconciliation pass suppresses a criterion that counts a signal another criterion has already counted, under conditions called out in Abou Tayoun 2018, Pejaver 2022, Walker 2023 and ClinGen SVI, and, for the last row, because two criteria summarise one gnomAD record:
 
 | Trigger | Suppressed | Source |
 |---------|------------|--------|
+| PVS1 fires AND PM1 fires | PM1 | Abou Tayoun 2018 |
+| PS3 or BS3 fires (curated functional evidence) | PP3, BP4 and BP7 | ClinGen SVI: experimental evidence outranks prediction |
 | PVS1 fires AND PP3 was driven by SpliceAI | PP3 | Walker 2023 |
 | PS1 fires AND PP3 was driven by REVEL | PP3 | Pejaver 2022 |
 | PM5 fires AND PP3 was driven by REVEL | PP3 | Pejaver 2022 |
 | PP3_Strong + PM1 (combined > Strong cap) | PM1 | Pejaver 2022 |
+| PP3 was driven by REVEL AND BP4 was driven by SpliceAI | BP4 | Walker 2023 |
+| BS1 or BA1 fires AND BS2 was decided on carriers (a dominant gene) | BS2 | one gnomAD record summarised twice |
+
+One further effect is an upgrade and not a suppression: PS1's splice path is graded against the PVS1 the variant already carries (Walker 2023 Table 3).
+
+BS2's arm for homozygotes and hemizygotes is not reconciled with BS1 and BA1, and on the X chromosome it counts the same frequency twice (`docs/ACMG.md`, limitation 29).
+
+PP2, PM1 and PP3 on one missense variant are not reconciled with each other beyond the PP3_Strong + PM1 row.
+A combined cap at Strong was measured and not adopted (`docs/ACMG.md`, limitation 27).
 
 Suppressed criteria stay in the result with `met=false` and a
 `details.suppressed_by_reconcile` note.
 
-### gnomAD v4 AN Minimum (SVI March 2024)
+### Allele-number minimum for BA1 and BS1
 
 BA1 and BS1 require gnomAD `all_an ≥ 2000` before they can fire. Below
 the threshold the criterion is NotEvaluated rather than fired on noisy
 estimates. Configurable via `min_an_for_frequency_criteria`.
+
+The 2,000 comes from the BA1 recommendation (Ghosh 2018), which asks for a dataset of at
+least 2,000 observed alleles; applying it to the allele number at the site, and to BS1, is
+this project's decision. The ClinGen VCEP Review Committee's March 2024 communication on
+gnomAD v4 states no allele-number floor. Switching it off adds 774 same-direction calls and
+no opposite-direction call on the ClinVar 2-star+ benchmark.
 
 ### Combination Rules (19 = 18 Richards 2015 + 1 SVI Sept 2020)
 
@@ -242,7 +265,8 @@ Concrete pipeline (`analysis/acmg_benchmark/scripts/run_benchmark.sh`):
 
 1. **Input**: ClinVar VCF filtered to review_status ≥ 2 stars
    (`criteria_provided,_multiple_submitters,_no_conflicts` and stricter)
-   on GRCh38, plus a parallel truth TSV (`chrom`, `pos`, `ref`, `alt`,
+   on GRCh38, plus a parallel table of ClinVar's classifications
+   (`clinvar_2star_labels.tsv`: `chrom`, `pos`, `ref`, `alt`,
    `gene`, `clnsig`, `normalized_class`, `review_stars`, `rcv`).
 2. **Annotation**: GFF3 + FASTA cache + supplementary annotation
    directory (`--sa-dir`) loaded once; all 673,660 variants annotated
@@ -251,7 +275,7 @@ Concrete pipeline (`analysis/acmg_benchmark/scripts/run_benchmark.sh`):
    stream-parses the JSON via `ijson` (memory-bounded — output is ~24 GB
    pretty-printed), keys each variant on `(chrom, pos, ref, alt)`,
    reads the picked transcript's `acmg.classification`, and fills a
-   5×6 truth × predicted matrix (extra column for NoCall).
+   5×6 ClinVar-classification × predicted matrix (extra column for NoCall).
 
 Outputs: `concordance_summary.txt` (free-text rollup),
 `concordance_matrix.csv`, `concordance_by_chrom.csv`,
@@ -355,7 +379,7 @@ Diagnosis of the lifts:
 3. **NoCall artefact in v4 was an indel allele-matching bug** (v4 → v5
    fix). The 6.8 % NoCall rate in v4 looked like a `--pick` ↔
    non-coding-transcript trade-off, but it was actually all 48,539
-   indels in the truth set falling into NoCall. VCF and VEP use
+   indels in the ClinVar 2-star+ set falling into NoCall. VCF and VEP use
    different allele conventions: VCF stores REF=`C`/ALT=`CT` for an
    insertion, but VEP's CSQ Allele field for the same variant is `T`
    (just the inserted base; `-` for a deletion). The original
@@ -428,16 +452,16 @@ Truth records: **673,660** · Classified: **673,659** · Truth-not-annotated: **
 | Likely Benign (n=128,038) | 2 | 55 | 73,367 | **47,473** | 7,141 | 0 |
 | Benign (n=156,512) | 5 | 59 | 64,025 | 28,942 | **63,481** | 0 |
 
-(Diagonal = exact-match. Same-direction lumps P+LP for P/LP truth and
-LB+B for LB/B truth.)
+(Diagonal = exact-match. Same-direction lumps P+LP for P/LP ClinVar
+classifications and LB+B for LB/B ones.)
 
 #### Headline metrics
 
 | Metric | Value |
 |--------|------:|
-| Exact-match (truth = predicted) | **58.7 %** |
-| Same-direction (truth & predicted both P-tier or both B-tier or both VUS) | **70.8 %** |
-| Opposite-direction (P/LP truth → B/LB predicted, or vice versa) | **313 / 673,660 = 0.05 %** |
+| Exact-match (ClinVar classification = predicted) | **58.7 %** |
+| Same-direction (ClinVar & predicted both P-tier or both B-tier or both VUS) | **70.8 %** |
+| Opposite-direction (ClinVar P/LP → B/LB predicted, or vice versa) | **313 / 673,660 = 0.05 %** |
 | NoCall after annotation | 0.0 % |
 
 Per-class same-direction recall:
@@ -555,9 +579,9 @@ non-PVS1 splice variants that the gate doesn't affect.)
 ba1_af_threshold = 0.05
 bs1_af_threshold = 0.01
 pm2_af_threshold = 0.0001            # legacy single-threshold field (back-compat)
-pm2_ad_af_threshold = 0.0            # AD / unknown: strict absence
-pm2_ar_af_threshold = 0.00007        # AR threshold (SVI v1.0)
-min_an_for_frequency_criteria = 2000 # gnomAD v4 AN minimum (SVI March 2024)
+pm2_ad_af_threshold = 0.00004        # not recessive-only (AD, both, unknown)
+pm2_ar_af_threshold = 0.00007        # recessive-only (equals the Hearing Loss VCEP's; SVI PM2 v1.0 gives no frequency)
+min_an_for_frequency_criteria = 2000 # BA1/BS1 allele-number floor (Ghosh 2018 dataset size; ours at the site)
 
 # REVEL thresholds (Pejaver 2022; missense only)
 pp3_revel_supporting = 0.644
@@ -587,7 +611,7 @@ pm2_downgrade_to_supporting = true
 use_pp5_bp6 = false
 use_clinvar_stars_as_ps4_proxy = false
 
-# Curated frequency-exception list - defaults to Ghosh 2018's nine plus three hypomorphs;
+# Curated frequency-exception list - defaults to Ghosh 2018's nine, three hypomorphs and three reviewer-named alleles;
 # users can extend or replace via TOML.
 [[ba1_exceptions]]
 gene = "HFE"
@@ -599,7 +623,7 @@ reason = "Hereditary hemochromatosis"
 mechanism = "LOF"
 bs1_af_threshold = 0.001
 
-# Per-disorder overrides for multi-disorder genes (SVI July 2025 scaffold)
+# Per-disorder overrides for multi-disorder genes (ClinGen guidance, January 2024, scaffold)
 [gene_overrides.GENE_X.disorders.disorder_a]
 inheritance = "AR"
 pm2_af_threshold = 0.00007
@@ -614,7 +638,7 @@ pm2_af_threshold = 0.00007
 - ClinGen SVI Recommendation for In-Trans Criterion (PM3) — Version 1.0.
 - Pejaver V, et al. Calibration of computational tools for missense variant pathogenicity classification and ClinGen recommendations for PP3/BP4 criteria. *Am J Hum Genet*. 2022;109(12):2163-2177.
 - Walker LC, et al. (ClinGen SVI Splicing Subgroup). Using the ACMG/AMP framework to capture evidence related to predicted and observed impact on splicing. *Am J Hum Genet*. 2023;110(7):1046-1067.
-- ClinGen SVI Working Group. Guidance to VCEPs Regarding gnomAD v4 (March 2024).
-- ClinGen SVI Working Group. Guidance Classifying Variants in Genes Associated with Multiple Disorders (July 2025).
+- ClinGen VCEP Review Committee. Communication to ClinGen VCEPs regarding gnomAD v4, version 1.0 (8 March 2024).
+- ClinGen. Guidance: Classifying Variants in Genes Associated with Multiple Disorders, version 1 (January 2024).
 - Tavtigian SV, et al. Modeling the ACMG/AMP variant classification guidelines as a Bayesian classification framework. *Genet Med*. 2018;20(9):1054-1060.
 - Lek M, et al. Analysis of protein-coding genetic variation in 60,706 humans. *Nature*. 2016;536(7616):285-291.

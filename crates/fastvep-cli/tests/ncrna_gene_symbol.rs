@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use fastvep_cli::pipeline::{run_annotate, AnnotateConfig};
+use fastvep_cli::pipeline::{run_annotate, AnnotateConfig, PickFlags};
 use tempfile::TempDir;
 
 /// One non-coding locus and one protein-coding one, typed the way Ensembl types
@@ -68,7 +68,7 @@ fn config(input: &Path, out: &Path) -> AnnotateConfig {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: true,
         distance: 5000,
         cache_dir: None,
@@ -86,6 +86,9 @@ fn config(input: &Path, out: &Path) -> AnnotateConfig {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     }
 }

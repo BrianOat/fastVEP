@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use fastvep_cli::pipeline::{run_annotate, AnnotateConfig};
+use fastvep_cli::pipeline::{run_annotate, AnnotateConfig, PickFlags};
 use tempfile::TempDir;
 
 const CDS: u64 = 1_001;
@@ -63,7 +63,7 @@ fn config(input: &Path, out: &Path) -> AnnotateConfig {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: true,
         distance: 5000,
         cache_dir: None,
@@ -81,6 +81,9 @@ fn config(input: &Path, out: &Path) -> AnnotateConfig {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     }
 }
@@ -186,6 +189,188 @@ fn a_sidecar_cache_that_will_not_load_is_rebuilt_from_the_gff3() {
         .contains("missense_variant"));
 }
 
+/// A sidecar written by a first run, which a second run reads.
+fn written_sidecar(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let gff3 = write_gff3(dir);
+    let fasta = write_fasta(dir);
+    let vcf = write_vcf(dir);
+    run_annotate(AnnotateConfig {
+        gff3: vec![gff3.to_string_lossy().into()],
+        fasta: Some(fasta.to_string_lossy().into()),
+        ..config(&vcf, &dir.join("first.vcf"))
+    })
+    .unwrap();
+    let sidecar = dir.join("ann.gff3.fastvep.cache");
+    assert!(sidecar.exists(), "the first run writes the sidecar");
+    (gff3, fasta, vcf, sidecar)
+}
+
+/// What ends a cache of one frame, after the frame: the skippable frame that holds the table of
+/// frames, which is a header of 8 bytes, an entry of 8 for the one frame, and a footer of 9. The
+/// last four bytes of the frame before it are its checksum.
+const TABLE_OF_ONE_FRAME: usize = 8 + 8 + 9;
+
+/// The cache of `sidecar` and three transcripts after it of 6 MiB each (of bases that compress to
+/// nothing, and on a contig that no variant is on), which `save_cache` cuts into two frames.
+fn a_cache_of_several_frames(dir: &Path, sidecar: &Path) -> PathBuf {
+    let mut transcripts = fastvep_cache::transcript_cache::load_cache(sidecar).unwrap();
+    for k in 0..3 {
+        let mut filler = transcripts[0].clone();
+        filler.stable_id = format!("ENST_FILLER_{k}").as_str().into();
+        filler.chromosome = "99".into();
+        filler.spliced_seq = Some("A".repeat(6 << 20));
+        transcripts.push(filler);
+    }
+    let path = dir.join("frames.cache");
+    fastvep_cache::transcript_cache::save_cache(&transcripts, &path).unwrap();
+    path
+}
+
+/// Where each frame of the file begins: the magic of a zstd frame.
+fn frame_starts(bytes: &[u8]) -> Vec<usize> {
+    let magic = [0x28, 0xB5, 0x2F, 0xFD];
+    (0..bytes.len() - 3)
+        .filter(|&at| bytes[at..at + 4] == magic)
+        .collect()
+}
+
+#[test]
+fn a_cache_of_several_frames_with_a_frame_damaged_stops_the_run_or_is_rebuilt_on_every_path() {
+    // A run of one thread reads the cache as a stream, and one of four takes its frames from the
+    // table and decodes them side by side: both have to refuse a frame that is damaged, and
+    // neither may annotate from what it had read of the others.
+    let dir = TempDir::new().unwrap();
+    let (gff3, fasta, vcf, sidecar) = written_sidecar(dir.path());
+    let several = a_cache_of_several_frames(dir.path(), &sidecar);
+    let good = std::fs::read(&several).unwrap();
+    let starts = frame_starts(&good);
+    assert_eq!(starts.len(), 2, "the cache is meant to be two frames");
+    let mut damaged = good.clone();
+    damaged[starts[1] + 16] ^= 0xFF;
+
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let named = |out: &Path| AnnotateConfig {
+            transcript_cache: Some(several.to_string_lossy().into()),
+            ..config(&vcf, out)
+        };
+        // as it was written, it is annotated from
+        std::fs::write(&several, &good).unwrap();
+        let out = dir.path().join("good.vcf");
+        pool.install(|| run_annotate(named(&out)))
+            .unwrap_or_else(|e| panic!("{threads} threads: {e:#}"));
+        assert!(std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("missense_variant"));
+        // with a byte of the second frame flipped, a cache that is named stops the run
+        std::fs::write(&several, &damaged).unwrap();
+        let err = pool
+            .install(|| run_annotate(named(&dir.path().join("bad.vcf"))))
+            .expect_err("a frame that fails its checksum must not be annotated from");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot be used") && msg.contains("Deserializing transcripts from cache"),
+            "{threads} threads: {msg}"
+        );
+        // and a sidecar that is damaged is rebuilt from the GFF3 and written again
+        std::fs::write(&sidecar, &damaged).unwrap();
+        make_fresh(&sidecar);
+        let out = dir.path().join("rebuilt.vcf");
+        pool.install(|| {
+            run_annotate(AnnotateConfig {
+                gff3: vec![gff3.to_string_lossy().into()],
+                fasta: Some(fasta.to_string_lossy().into()),
+                ..config(&vcf, &out)
+            })
+        })
+        .unwrap_or_else(|e| panic!("{threads} threads: rebuilt from the GFF3, not fatal: {e:#}"));
+        assert!(std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("missense_variant"));
+        assert_ne!(std::fs::read(&sidecar).unwrap(), damaged);
+        assert!(fastvep_cache::transcript_cache::load_cache(&sidecar).is_ok());
+    }
+}
+
+#[test]
+fn a_sidecar_cache_corrupted_in_place_is_rebuilt_and_not_read_as_what_it_became() {
+    // `save_cache` records a checksum in each frame so that a cache corrupted in place fails at
+    // load. The loader did not reliably read it: a cache with the last byte of its checksum
+    // flipped, or with bytes after its frame, loaded as it was and the run annotated from it. So
+    // did one with a byte of its middle flipped, and one with a second cache after it, which a
+    // `cat` makes: the transcripts of the second were left out and nothing said so.
+    for damage in [
+        "the checksum of the frame flipped",
+        "a byte of the middle flipped",
+        "bytes after the frame",
+        "a second cache after it",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (gff3, fasta, vcf, sidecar) = written_sidecar(dir.path());
+        let good = std::fs::read(&sidecar).unwrap();
+        let mut damaged = good.clone();
+        match damage {
+            "the checksum of the frame flipped" => {
+                let checksum = damaged.len() - TABLE_OF_ONE_FRAME - 1;
+                damaged[checksum] ^= 0xFF
+            }
+            "a byte of the middle flipped" => {
+                let middle = damaged.len() / 2;
+                damaged[middle] ^= 0xFF;
+            }
+            "bytes after the frame" => damaged.extend_from_slice(b"not a zstd frame"),
+            _ => damaged.extend_from_slice(&good),
+        }
+        std::fs::write(&sidecar, &damaged).unwrap();
+        make_fresh(&sidecar);
+
+        let out = dir.path().join("second.vcf");
+        run_annotate(AnnotateConfig {
+            gff3: vec![gff3.to_string_lossy().into()],
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, &out)
+        })
+        .unwrap_or_else(|e| panic!("{damage}: rebuilt from the GFF3, not fatal: {e:#}"));
+        assert!(
+            std::fs::read_to_string(&out)
+                .unwrap()
+                .contains("missense_variant"),
+            "{damage}"
+        );
+        // rewritten: it was not the cache that was read
+        assert_ne!(std::fs::read(&sidecar).unwrap(), damaged, "{damage}");
+        assert!(
+            fastvep_cache::transcript_cache::load_cache(&sidecar).is_ok(),
+            "{damage}"
+        );
+    }
+}
+
+#[test]
+fn a_cache_named_on_the_command_line_that_is_corrupted_in_place_stops_the_run() {
+    let dir = TempDir::new().unwrap();
+    let (_, _, vcf, sidecar) = written_sidecar(dir.path());
+    let mut damaged = std::fs::read(&sidecar).unwrap();
+    let checksum = damaged.len() - TABLE_OF_ONE_FRAME - 1;
+    damaged[checksum] ^= 0xFF;
+    let named = dir.path().join("named.cache");
+    std::fs::write(&named, &damaged).unwrap();
+
+    let err = run_annotate(AnnotateConfig {
+        transcript_cache: Some(named.to_string_lossy().into()),
+        ..config(&vcf, &dir.path().join("out.vcf"))
+    })
+    .expect_err("a cache that fails its checksum must not be annotated from");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cannot be used") && msg.contains("checksum"),
+        "unexpected error: {msg}"
+    );
+}
+
 /// Write a well-formed cache in the pre-#90 FSTVEP02 format, holding `n`
 /// transcripts. Deliberately valid: the whole difficulty is that a poisoned
 /// region-restricted cache and a whole-file one are the same bytes with a
@@ -258,7 +443,7 @@ fn a_pre_90_sidecar_cache_is_rebuilt_rather_than_trusted() {
             .unwrap();
     }
     assert_eq!(
-        &magic, b"FSTVEP05",
+        &magic, b"FSTVEP10",
         "rebuild should publish the current format"
     );
 }
@@ -351,6 +536,207 @@ fn a_pre_appris_sidecar_cache_is_rebuilt_rather_than_trusted() {
     );
 }
 
+/// Write a well-formed cache in the pre-protein-version FSTVEP05 format. Whole-file, every
+/// gene named, APPRIS read - the only thing wrong with it is that the parser which filled it
+/// gave every protein version 1, whatever the GFF3's CDS records said.
+fn write_v5_cache(path: &Path, transcripts: &[fastvep_genome::Transcript]) {
+    use std::io::{BufWriter, Write};
+    let file = File::create(path).unwrap();
+    let mut zst = zstd::Encoder::new(BufWriter::new(file), 1).unwrap();
+    zst.write_all(b"FSTVEP05").unwrap();
+    bincode::serialize_into(&mut zst, transcripts).unwrap();
+    zst.finish().unwrap().flush().unwrap();
+}
+
+#[test]
+fn a_pre_protein_version_sidecar_cache_is_rebuilt_rather_than_trusted() {
+    // Fourth instance of the same gap, and the one that shows it on the answer: the GFF3's
+    // CDS records say the protein is version 3, the cache the old parser wrote says 1, and
+    // the sidecar is newer than its GFF3, so a user who upgrades and re-runs the identical
+    // command would keep `ENSP_A.1:p.` for ever if the stale cache were read.
+    let dir = TempDir::new().unwrap();
+    let gff3 = write_gff3(dir.path());
+    // `ID=CDS:ENSP_A;Parent=...` is the last line: give the CDS a version
+    let text = std::fs::read_to_string(&gff3).unwrap();
+    std::fs::write(&gff3, format!("{};version=3\n", text.trim_end())).unwrap();
+    let fasta = write_fasta(dir.path());
+    let vcf = write_vcf(dir.path());
+    let run = |out: &Path| {
+        run_annotate(AnnotateConfig {
+            gff3: vec![gff3.to_string_lossy().into()],
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, out)
+        })
+        .expect("annotation should succeed");
+        std::fs::read_to_string(out).unwrap()
+    };
+
+    // the ordinary way: the version is the GFF3's
+    let first = run(&dir.path().join("first.vcf"));
+    assert!(
+        first.contains("ENSP_A.3:p."),
+        "the protein version is the CDS record's; got:\n{first}"
+    );
+
+    // what the old parser would have left beside the GFF3: the same transcripts, version 1
+    let sidecar = dir.path().join("ann.gff3.fastvep.cache");
+    let mut transcripts = fastvep_cache::transcript_cache::load_cache(&sidecar).unwrap();
+    assert!(transcripts.iter().all(|t| t.protein_version == Some(3)));
+    for t in &mut transcripts {
+        t.protein_version = Some(1);
+    }
+    write_v5_cache(&sidecar, &transcripts);
+    make_fresh(&sidecar);
+
+    let second = run(&dir.path().join("second.vcf"));
+    assert!(
+        second.contains("ENSP_A.3:p.") && !second.contains("ENSP_A.1:p."),
+        "the run trusted a pre-protein-version cache; got:\n{second}"
+    );
+}
+
+/// Write a well-formed cache in the pre-RefSeq-naming FSTVEP06 format. Whole-file, APPRIS
+/// read, protein versions right - the only thing wrong with it is that the parser which
+/// filled it named a RefSeq transcript by its ID, its gene by its own ID and its biotype by
+/// its SO term.
+fn write_v6_cache(path: &Path, transcripts: &[fastvep_genome::Transcript]) {
+    use std::io::{BufWriter, Write};
+    let file = File::create(path).unwrap();
+    let mut zst = zstd::Encoder::new(BufWriter::new(file), 1).unwrap();
+    zst.write_all(b"FSTVEP06").unwrap();
+    bincode::serialize_into(&mut zst, transcripts).unwrap();
+    zst.finish().unwrap().flush().unwrap();
+}
+
+#[test]
+fn a_pre_refseq_names_sidecar_cache_is_rebuilt_rather_than_trusted() {
+    // Fifth instance of the same gap, and again it shows on the answer: a RefSeq GFF3 names a
+    // transcript `rna-NM_000001.3` by its ID and `NM_000001.3` by its `transcript_id`, its
+    // gene `gene-TP` and `7157` by its Dbxref, and Ensembl VEP writes the second of each. The
+    // sidecar is newer than its GFF3, so a user who upgrades and re-runs the identical
+    // command would keep the old names for ever if the stale cache were read.
+    let dir = TempDir::new().unwrap();
+    let gff3 = dir.path().join("refseq.gff3");
+    let end = CDS + 11;
+    std::fs::write(
+        &gff3,
+        format!(
+            "1\tBestRefSeq\tgene\t{CDS}\t{end}\t.\t+\t.\tID=gene-TP;Dbxref=GeneID:7157;Name=TP;gbkey=Gene;gene=TP;gene_biotype=protein_coding\n\
+             1\tBestRefSeq\tmRNA\t{CDS}\t{end}\t.\t+\t.\tID=rna-NM_000001.3;Parent=gene-TP;Dbxref=GeneID:7157,GenBank:NM_000001.3;gbkey=mRNA;gene=TP;transcript_id=NM_000001.3\n\
+             1\tBestRefSeq\texon\t{CDS}\t{end}\t.\t+\t.\tID=exon-NM_000001.3-1;Parent=rna-NM_000001.3;transcript_id=NM_000001.3\n\
+             1\tBestRefSeq\tCDS\t{CDS}\t{end}\t.\t+\t0\tID=cds-NP_000001.2;Parent=rna-NM_000001.3;gbkey=CDS;gene=TP;protein_id=NP_000001.2\n"
+        ),
+    )
+    .unwrap();
+    let fasta = write_fasta(dir.path());
+    let vcf = write_vcf(dir.path());
+    let run = |out: &Path| {
+        run_annotate(AnnotateConfig {
+            gff3: vec![gff3.to_string_lossy().into()],
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, out)
+        })
+        .expect("annotation should succeed");
+        std::fs::read_to_string(out).unwrap()
+    };
+
+    // the ordinary way: Ensembl VEP's names
+    let first = run(&dir.path().join("first.vcf"));
+    assert!(
+        first.contains("|7157|Transcript|NM_000001.3|protein_coding|"),
+        "a RefSeq transcript is named as VEP names it; got:\n{first}"
+    );
+    assert!(first.contains("NM_000001.3:c.") && first.contains("NP_000001.2:p."));
+
+    // what the old parser would have left beside the GFF3
+    let sidecar = dir.path().join("refseq.gff3.fastvep.cache");
+    let mut transcripts = fastvep_cache::transcript_cache::load_cache(&sidecar).unwrap();
+    for t in &mut transcripts {
+        t.stable_id = format!("rna-{}", t.stable_id).into();
+        t.gene.stable_id = "gene-TP".into();
+        t.biotype = "mRNA".into();
+    }
+    write_v6_cache(&sidecar, &transcripts);
+    make_fresh(&sidecar);
+
+    let second = run(&dir.path().join("second.vcf"));
+    assert!(
+        second.contains("|7157|Transcript|NM_000001.3|protein_coding|")
+            && !second.contains("rna-NM_"),
+        "the run trusted a pre-RefSeq-names cache; got:\n{second}"
+    );
+}
+
+/// Write a well-formed cache in the pre-parity FSTVEP07 format. Whole-file, names right, protein
+/// versions right - the only thing wrong with it is that the parser which filled it left a RefSeq
+/// gene with no symbol source and no canonical transcript.
+fn write_v7_cache(path: &Path, transcripts: &[fastvep_genome::Transcript]) {
+    use std::io::{BufWriter, Write};
+    let file = File::create(path).unwrap();
+    let mut zst = zstd::Encoder::new(BufWriter::new(file), 1).unwrap();
+    zst.write_all(b"FSTVEP07").unwrap();
+    bincode::serialize_into(&mut zst, transcripts).unwrap();
+    zst.finish().unwrap().flush().unwrap();
+}
+
+#[test]
+fn a_pre_cache_parity_sidecar_cache_is_rebuilt_rather_than_trusted() {
+    // Sixth instance of the same gap, and again it shows on the answer: Ensembl VEP's RefSeq
+    // cache writes `EntrezGene` for the symbol source of a RefSeq gene and marks its MANE Select
+    // transcript canonical, and the parser that wrote a V7 cache did neither. The sidecar is newer
+    // than its GFF3, so a user who upgrades and re-runs the identical command would keep an empty
+    // symbol source for ever if the stale cache were read.
+    let dir = TempDir::new().unwrap();
+    let gff3 = dir.path().join("refseq.gff3");
+    let end = CDS + 11;
+    std::fs::write(
+        &gff3,
+        format!(
+            "1\tBestRefSeq\tgene\t{CDS}\t{end}\t.\t+\t.\tID=gene-TP;Dbxref=GeneID:7157,HGNC:HGNC:11998;Name=TP;gbkey=Gene;gene=TP;gene_biotype=protein_coding\n\
+             1\tBestRefSeq\tmRNA\t{CDS}\t{end}\t.\t+\t.\tID=rna-NM_000001.3;Parent=gene-TP;Dbxref=Ensembl:ENST00000269305.9,GeneID:7157,GenBank:NM_000001.3;gbkey=mRNA;gene=TP;tag=MANE Select;transcript_id=NM_000001.3\n\
+             1\tBestRefSeq\texon\t{CDS}\t{end}\t.\t+\t.\tID=exon-NM_000001.3-1;Parent=rna-NM_000001.3;transcript_id=NM_000001.3\n\
+             1\tBestRefSeq\tCDS\t{CDS}\t{end}\t.\t+\t0\tID=cds-NP_000001.2;Parent=rna-NM_000001.3;gbkey=CDS;gene=TP;protein_id=NP_000001.2\n"
+        ),
+    )
+    .unwrap();
+    let fasta = write_fasta(dir.path());
+    let vcf = write_vcf(dir.path());
+    let run = |out: &Path| {
+        run_annotate(AnnotateConfig {
+            gff3: vec![gff3.to_string_lossy().into()],
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, out)
+        })
+        .expect("annotation should succeed");
+        std::fs::read_to_string(out).unwrap()
+    };
+    // `SYMBOL_SOURCE`, `CANONICAL`, `MANE`, then `MANE_SELECT` follow `HGNC_ID` in the CSQ
+    let wanted = "|YES|EntrezGene||MANE_Select|ENST00000269305.9|";
+
+    let first = run(&dir.path().join("first.vcf"));
+    assert!(
+        first.contains(wanted),
+        "a RefSeq gene is EntrezGene, its MANE Select transcript canonical; got:\n{first}"
+    );
+
+    // what the old parser would have left beside the GFF3
+    let sidecar = dir.path().join("refseq.gff3.fastvep.cache");
+    let mut transcripts = fastvep_cache::transcript_cache::load_cache(&sidecar).unwrap();
+    for t in &mut transcripts {
+        t.gene.symbol_source = None;
+        t.canonical = false;
+        t.mane_select = None;
+    }
+    write_v7_cache(&sidecar, &transcripts);
+    make_fresh(&sidecar);
+
+    let second = run(&dir.path().join("second.vcf"));
+    assert!(
+        second.contains(wanted),
+        "the run trusted a pre-parity cache; got:\n{second}"
+    );
+}
+
 #[test]
 fn a_pre_90_explicit_transcript_cache_stops_the_run() {
     // Named explicitly there is nothing to fall back to, so the only safe answer
@@ -402,4 +788,200 @@ fn a_pre_90_explicit_transcript_cache_stops_the_run() {
                 .contains("intergenic_variant"),
         "a rejected cache must not leave an all-intergenic output behind"
     );
+}
+
+/// The sidecar cache is written in the order the provider keeps transcripts in (by contig, then by
+/// start, and ties as the file has them), so that a run that loads it has nothing to sort: sorting
+/// some 600-byte structs was a tenth of the start of a run on the human GFF3, and a cache in that
+/// order is also less than half the size, because zstd finds what its neighbours share. A second
+/// run, which loads it, answers as the first did.
+#[test]
+fn a_sidecar_cache_is_written_in_the_providers_order_and_answers_as_the_run_that_wrote_it() {
+    let dir = TempDir::new().unwrap();
+    // five genes on two contigs, in the file in no order, two with the same start
+    let genes = [
+        ("2", 5_000u64),
+        ("1", 9_000),
+        ("2", 1_000),
+        ("1", 3_000),
+        ("1", 3_000),
+    ];
+    let mut gff3 = String::new();
+    for (i, (chrom, start)) in genes.iter().enumerate() {
+        let end = start + 11;
+        gff3.push_str(&format!(
+            "{chrom}\ttest\tgene\t{start}\t{end}\t.\t+\t.\tID=gene:G{i};biotype=protein_coding\n\
+             {chrom}\ttest\tmRNA\t{start}\t{end}\t.\t+\t.\tID=transcript:T{i};Parent=gene:G{i};biotype=protein_coding\n\
+             {chrom}\ttest\texon\t{start}\t{end}\t.\t+\t.\tID=exon:E{i};Parent=transcript:T{i};rank=1\n\
+             {chrom}\ttest\tCDS\t{start}\t{end}\t.\t+\t0\tID=CDS:P{i};Parent=transcript:T{i}\n"
+        ));
+    }
+    let gff3_path = dir.path().join("ann.gff3");
+    std::fs::write(&gff3_path, gff3).unwrap();
+    // both contigs, with a start codon, a codon and a stop at every gene
+    let fasta = dir.path().join("ref.fa");
+    let mut f = File::create(&fasta).unwrap();
+    for chrom in ["1", "2"] {
+        let mut seq = vec![b'N'; 10_000];
+        for (c, start) in genes.iter().filter(|(c, _)| *c == chrom) {
+            let at = (*start - 1) as usize;
+            seq[at..at + 12].copy_from_slice(b"ATGTGGCGGTAA");
+            let _ = c;
+        }
+        writeln!(f, ">{chrom}").unwrap();
+        for chunk in seq.chunks(60) {
+            f.write_all(chunk).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+    }
+    drop(f);
+    let vcf = write_vcf(dir.path());
+
+    let run = |out: &str| {
+        let out = dir.path().join(out);
+        run_annotate(AnnotateConfig {
+            gff3: vec![gff3_path.to_string_lossy().into()],
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, &out)
+        })
+        .expect("the run succeeds");
+        std::fs::read_to_string(&out).unwrap()
+    };
+    let first = run("first.vcf");
+
+    let sidecar = dir.path().join("ann.gff3.fastvep.cache");
+    let cached = fastvep_cache::transcript_cache::load_cache(&sidecar).expect("a sidecar cache");
+    assert_eq!(cached.len(), genes.len());
+    assert!(
+        cached
+            .windows(2)
+            .all(|w| (&*w[0].chromosome, w[0].start) <= (&*w[1].chromosome, w[1].start)),
+        "the cache is not in the provider's order: {:?}",
+        cached
+            .iter()
+            .map(|t| (t.chromosome.to_string(), t.start))
+            .collect::<Vec<_>>()
+    );
+    // the two that start together are in the order the file has them
+    let ids: Vec<&str> = cached.iter().map(|t| &*t.stable_id).collect();
+    let (t3, t4) = (
+        ids.iter().position(|i| *i == "T3").unwrap(),
+        ids.iter().position(|i| *i == "T4").unwrap(),
+    );
+    assert!(t3 < t4, "a tie changed places: {ids:?}");
+
+    assert_eq!(run("second.vcf"), first);
+}
+
+/// A well-formed cache in the given older format, holding `transcripts`.
+fn write_cache_in_format(path: &Path, magic: &[u8; 8], transcripts: &[fastvep_genome::Transcript]) {
+    use std::io::{BufWriter, Write};
+    let file = File::create(path).unwrap();
+    let mut zst = zstd::Encoder::new(BufWriter::new(file), 1).unwrap();
+    zst.write_all(magic).unwrap();
+    bincode::serialize_into(&mut zst, transcripts).unwrap();
+    zst.finish().unwrap().flush().unwrap();
+}
+
+#[test]
+fn a_pre_gff_checks_sidecar_cache_is_rebuilt_rather_than_trusted() {
+    // The same gap once more. The parser that wrote a V8 cache read a CDS with no phase as
+    // `u64::MAX` bases of padding and kept a transcript whose exons overlap, and the sidecar is
+    // newer than its GFF3, so a user who upgrades and re-runs the identical command would get
+    // the cache's transcripts again if it were read. A transcript with a name that no GFF3 has
+    // stands in for what it holds: the run has to be about the GFF3's.
+    let dir = TempDir::new().unwrap();
+    let gff3 = write_gff3(dir.path());
+    let fasta = write_fasta(dir.path());
+    let vcf = write_vcf(dir.path());
+    let run = |out: &Path| {
+        run_annotate(AnnotateConfig {
+            gff3: vec![gff3.to_string_lossy().into()],
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, out)
+        })
+        .expect("annotation should succeed");
+        std::fs::read_to_string(out).unwrap()
+    };
+    let first = run(&dir.path().join("first.vcf"));
+    assert!(first.contains("ENST_A"), "{first}");
+
+    let sidecar = dir.path().join("ann.gff3.fastvep.cache");
+    let mut transcripts = fastvep_cache::transcript_cache::load_cache(&sidecar).unwrap();
+    for t in &mut transcripts {
+        t.stable_id = "ENST_FROM_THE_STALE_CACHE".into();
+    }
+    write_cache_in_format(&sidecar, b"FSTVEP08", &transcripts);
+    make_fresh(&sidecar);
+
+    let second = run(&dir.path().join("second.vcf"));
+    assert!(
+        second.contains("ENST_A") && !second.contains("ENST_FROM_THE_STALE_CACHE"),
+        "the run trusted a pre-GFF3-checks cache; got:\n{second}"
+    );
+
+    // and the one after it, whose reader read the CDS flags of an organelle contig off the
+    // standard genetic code
+    write_cache_in_format(&sidecar, b"FSTVEP09", &transcripts);
+    make_fresh(&sidecar);
+    let third = run(&dir.path().join("third.vcf"));
+    assert!(
+        third.contains("ENST_A") && !third.contains("ENST_FROM_THE_STALE_CACHE"),
+        "the run trusted a pre-organelle cache; got:\n{third}"
+    );
+}
+
+/// A cache named on the command line has no GFF3 to be rebuilt from, so a cache of a format that
+/// cannot be trusted stops the run, and says what is wrong with it at the length the explicit path
+/// owes (the detail) and how to get a good one. Each of the formats since the parity fix, because
+/// each has its own reason, which is what the message is for.
+#[test]
+fn an_explicit_transcript_cache_of_a_stale_format_stops_the_run_and_says_why() {
+    for (magic, format, reason) in [
+        (b"FSTVEP07", "FSTVEP07", "EntrezGene"),
+        (b"FSTVEP08", "FSTVEP08", "no phase"),
+        (b"FSTVEP09", "FSTVEP09", "Mito"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let gff3 = write_gff3(dir.path());
+        let fasta = write_fasta(dir.path());
+        let vcf = write_vcf(dir.path());
+        // a cache made by this build, of the GFF3 the stale one stands for
+        let good = dir.path().join("good.cache");
+        run_annotate(AnnotateConfig {
+            gff3: vec![gff3.to_string_lossy().into()],
+            transcript_cache: Some(good.to_string_lossy().into()),
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, &dir.path().join("first.vcf"))
+        })
+        .expect("a cache is written from the GFF3");
+        let transcripts = fastvep_cache::transcript_cache::load_cache(&good).unwrap();
+
+        let stale = dir.path().join("stale.cache");
+        write_cache_in_format(&stale, magic, &transcripts);
+        let out = dir.path().join("out.vcf");
+        let err = run_annotate(AnnotateConfig {
+            transcript_cache: Some(stale.to_string_lossy().into()),
+            fasta: Some(fasta.to_string_lossy().into()),
+            ..config(&vcf, &out)
+        })
+        .expect_err("a stale --transcript-cache must not annotate anyway");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains(format), "{format}: {msg}");
+        assert!(
+            msg.contains(reason),
+            "{format}: the detail is missing: {msg}"
+        );
+        assert!(msg.contains("fastvep cache"), "{format}: no way out: {msg}");
+        assert!(
+            !msg.contains("let the sidecar rebuild itself")
+                && !msg.contains("truncated or corrupt"),
+            "{format}: {msg}"
+        );
+        assert!(
+            !out.exists() || std::fs::read_to_string(&out).unwrap().is_empty(),
+            "{format}: a rejected cache must not leave an output behind"
+        );
+    }
 }

@@ -12,8 +12,24 @@ pub mod pvs1;
 use crate::config::AcmgConfig;
 use crate::sa_extract::ClassificationInput;
 use crate::types::{EvidenceCriterion, EvidenceStrength};
+use fastvep_core::HgvsPlacement;
 
-/// Evaluate all 28 ACMG-AMP criteria and return the full list.
+/// How a criterion reports where HGVS placed the change, in its `details`.
+pub(crate) fn placement_detail(placement: HgvsPlacement) -> serde_json::Value {
+    match placement {
+        HgvsPlacement::Intronic { offset } => {
+            serde_json::json!({ "kind": "intronic", "offset": offset })
+        }
+        HgvsPlacement::Exonic { in_frame } => {
+            serde_json::json!({ "kind": "exonic", "in_frame": in_frame })
+        }
+        HgvsPlacement::Spans => serde_json::json!({ "kind": "spans" }),
+    }
+}
+
+/// Evaluate every ACMG-AMP criterion and return the full list: 28, or 26 when
+/// `use_pp5_bp6` is off, which is the default, because PP5 and BP6 are then not
+/// evaluated at all.
 ///
 /// After per-criterion evaluation, a reconciliation pass suppresses
 /// computational evidence (PP3/BP4) that would double-count with criteria
@@ -120,44 +136,96 @@ fn push_with_overrides(
     criteria.push(c);
 }
 
-/// Suppress double-counted evidence per ClinGen SVI guidance.
+/// Suppress double-counted evidence.
 ///
 /// Why this exists: PP3/BP4 are *computational* surrogates for molecular
-/// effects that other criteria capture more directly. Letting both fire
-/// inflates the evidence weight for the same biological signal. Pejaver 2022
-/// (PP3/BP4 calibration) and Walker 2023 (splicing) explicitly call this out.
+/// effects that other criteria capture more directly, and BS2 counts, in a
+/// dominant gene, the same gnomAD alleles that BS1 and BA1 test. Letting both
+/// fire inflates the evidence weight for the same biological signal. Pejaver
+/// 2022 (PP3/BP4 calibration) and Walker 2023 (splicing) explicitly call out the
+/// first kind.
 ///
-/// Rules applied (each leaves a trail in the affected criterion's `summary`
-/// and `details.suppressed_by` so downstream consumers see why a code that
-/// could have fired didn't):
+/// The rules, numbered in the order they were added. Each is a function of the
+/// criteria that fired, and none reads what another set aside, except that PM1
+/// set aside by rule 0 is not set aside again by rule 4; rules 6 and 7 run first
+/// because they touch no criterion the others read. Each suppression leaves a
+/// trail in the affected criterion's `summary` and in
+/// `details.suppressed_by_reconcile`, so that downstream consumers see why a code
+/// that could have fired didn't:
 ///
-/// 1. **PVS1 + PP3 (splice)** — if PVS1 fires for a canonical splice variant
-///    and PP3 was met from SpliceAI, the splicing signal is already counted.
-///    PP3 is suppressed (Walker 2023).
+/// 0.  **PVS1 + PM1** - a null variant already carries the strongest possible
+///     statement about the region it destroys, so residue-level hotspot
+///     evidence on top of it double-counts. PM1 is suppressed (Abou Tayoun
+///     2018; raised by the round-2 review on CBS, MSH6 and RYR1).
 ///
-/// 2. **PS1 + PP3 (REVEL)** — PS1 means a known pathogenic missense exists at
-///    the same residue + same alt AA; that's stronger residue-level evidence
-///    than REVEL. PP3 is suppressed when both fire on missense (Pejaver 2022).
+/// 0b. **PS3 or BS3 + any computational criterion** - curated functional
+///     evidence outranks every prediction, so PP3, BP4 and BP7 are suppressed
+///     whichever direction the assay points (ClinGen SVI; Brnich 2020).
 ///
-/// 3. **PM5 + PP3 (REVEL)** — same logic as PS1: PM5 covers a different alt
-///    AA at a known pathogenic residue. PP3 is suppressed (Pejaver 2022).
+/// 1.  **PVS1 + PP3 (splice)** - if PVS1 fires for a canonical splice variant
+///     and PP3 was met from SpliceAI, the splicing signal is already counted.
+///     PP3 is suppressed (Walker 2023).
 ///
-/// 4. **PP3 + PM1 strength cap** — Pejaver 2022 recommends capping the
-///    combined evidence weight at Strong (4 Tavtigian points). When PP3 is
-///    elevated to Strong (the only case where the combined points exceed 4),
-///    PM1 is suppressed. PP3 at Moderate or Supporting + PM1 stays within the
-///    cap and both fire.
+/// 2.  **PS1 + PP3 (REVEL)** - PS1 means a known pathogenic missense exists at
+///     the same residue + same alt AA; that's stronger residue-level evidence
+///     than REVEL. PP3 is suppressed when both fire on missense (Pejaver 2022).
+///
+/// 3.  **PM5 + PP3 (REVEL)** - same logic as PS1: PM5 covers a different alt
+///     AA at a known pathogenic residue. PP3 is suppressed (Pejaver 2022).
+///
+/// 4.  **PP3 + PM1 strength cap** - Pejaver 2022 recommends capping the
+///     combined evidence weight at Strong (4 Tavtigian points). When PP3 is
+///     elevated to Strong (the only case where the combined points exceed 4),
+///     PM1 is suppressed. PP3 at Moderate or Supporting + PM1 stays within the
+///     cap and both fire.
+///
+/// 5.  **PP3 (REVEL) + BP4 (SpliceAI)** - a missense variant is judged twice,
+///     once for the amino-acid change and once for splicing. Walker 2023's
+///     section "Combined application of ACMG/AMP codes" recommends that "the
+///     effects on the protein with and without splicing impact be evaluated
+///     independently as separate variant classifications based on these
+///     different mechanisms, with the most deleterious classification resulting
+///     in the final classification" (quoted from the medRxiv version,
+///     PMC9980257; the published article's text could not be checked here).
+///     BP4 from SpliceAI says only that splicing is unaffected, which is true
+///     and says nothing about the protein, so it is not a vote against a
+///     damaging missense prediction. It is suppressed when PP3 was met from
+///     REVEL. The mirror - BP4 from a benign REVEL score beside PP3 from
+///     SpliceAI - is left alone. Applying the principle symmetrically would
+///     withhold benign calls, and on the ClinVar 2-star+ benchmark it recovers
+///     no Pathogenic or Likely pathogenic call, because the BP4 is not what
+///     holds those variants at VUS (`analysis/acmg_benchmark/RUN_VERSIONS.md`,
+///     "v36 to v37"). The repo's stance on that trade is that a missed
+///     diagnosis is the worse error, which is a reason to act only where one is
+///     recovered.
+///
+/// 7.  **BS2 (carriers) + BS1 or BA1** - in a dominant gene BS2 counts the
+///     individuals who carry the allele, which is the allele count that BS1 and
+///     BA1 read their frequency from. Once either has fired, BS2 is the same
+///     gnomAD observation counted a second time, and two strong benign criteria
+///     are what reads as Benign under the Richards rules. See
+///     `suppress_bs2_carriers_beside_frequency` for what that did.
 ///
 /// It also applies one *upgrade*, which is not suppression but needs the same
 /// cross-criterion view:
 ///
-/// 5. **PS1 (splice) graded against PVS1** - Walker 2023 Table 3 sets PS1's
-///    strength for a canonical-dinucleotide variant from the PVS1 code the
-///    variant already carries: `PS1_Supporting` under a full-strength PVS1, and
-///    full `PS1` under a downgraded one, so that a variant whose null evidence
-///    was reduced is not also denied the borrowed clinical evidence.
+/// 6.  **PS1 (splice) graded against PVS1** - Walker 2023 Table 3 sets PS1's
+///     strength for a canonical-dinucleotide variant from the PVS1 code the
+///     variant already carries: `PS1_Supporting` under a full-strength PVS1, and
+///     full `PS1` under a downgraded one, so that a variant whose null evidence
+///     was reduced is not also denied the borrowed clinical evidence.
+///
+/// **What this pass does not do** is as much a part of its behaviour. PP2, PM1
+/// and PP3 on one missense variant are counted as three independent criteria, as
+/// the point system counts them and although they can be correlated, except
+/// where rule 4 removes PM1 beside a Strong PP3. A combined cap at Strong (4
+/// points) was measured on the ClinVar 2-star+ benchmark and not adopted: it
+/// gives up 320 correct pathogenic-side calls for 3 false-pathogenic calls
+/// avoided and 587 ClinVar-VUS variants kept at VUS, and it changes the
+/// combining rule without correcting a defect (`docs/ACMG.md`, limitation 27).
 fn reconcile_evidence(criteria: &mut [EvidenceCriterion]) {
     grade_ps1_splice_against_pvs1(criteria);
+    suppress_bs2_carriers_beside_frequency(criteria);
 
     // Collect the firing state of each criterion of interest before we mutate
     // anything. Using indices avoids borrow issues with mutable iteration.
@@ -263,6 +331,24 @@ fn reconcile_evidence(criteria: &mut [EvidenceCriterion]) {
     let pp3_from_revel = pp3_source == "revel_missense";
     let pp3_from_splice = pp3_source == "spliceai";
     let pp3_strength = criteria[pp3_i].strength;
+
+    // Rule 5: PP3 (REVEL) + BP4 (SpliceAI) - drop the BP4. Independent of the
+    // rules below, so it does not return: PS1 or PM5 may go on to suppress the
+    // PP3, and the protein-level evidence they stand for is no more of a
+    // dissent from a splice prediction than the PP3 was.
+    if pp3_from_revel {
+        for c in criteria.iter_mut() {
+            let splice_bp4 = c.met
+                && c.code.starts_with("BP4")
+                && c.details.get("bp4_source").and_then(|v| v.as_str()) == Some("spliceai");
+            if splice_bp4 {
+                suppress(
+                    c,
+                    "Suppressed: REVEL supports a damaging missense effect (PP3), and SpliceAI saying splicing is unaffected is not evidence against it; the protein and splicing effects are assessed separately and the more deleterious stands (Walker 2023).",
+                );
+            }
+        }
+    }
 
     // Rule 1: PVS1 + PP3(splice) — drop PP3.
     if pvs1_met && pp3_from_splice {
@@ -412,6 +498,69 @@ fn grade_ps1_splice_against_pvs1(criteria: &mut [EvidenceCriterion]) {
             c.summary,
             pvs1_strength.as_str()
         );
+    }
+}
+
+/// Whether `code` is `base` or a graded form of it (`BS1`, `BS1_Supporting`).
+///
+/// Compared in place, because this runs for every criterion of every allele and
+/// transcript, and building the `base_` prefix with `format!` allocated a
+/// `String` for each comparison.
+fn is_criterion(code: &str, base: &str) -> bool {
+    code.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+}
+
+/// Rule 7: drop BS2's carrier count when BS1 or BA1 has already counted the
+/// frequency it is made of.
+///
+/// BS2 has two arms. For a gene that is not dominant only it counts individuals
+/// with no working copy (homozygotes, hemizygotes). For a dominant gene it counts
+/// carriers - `AC - nhomalt` - and a carrier count is the allele count under
+/// another name: BS1 and BA1 turn the allele count into a frequency and test it
+/// against a bar. They test the filtering allele frequency of the population
+/// with the highest one and the arm tests the global carrier count, so clearing
+/// their bar does not make the arm fire (it fired on 7,234 of the 7,328 variants
+/// that meet BS1 in the genes curated as dominant only), but where both fire they
+/// summarise one gnomAD record twice and add a second Strong criterion for it.
+/// Under the Richards rules two Strong benign criteria are Benign.
+///
+/// The arm for homozygotes and hemizygotes is not reconciled. A homozygote is a
+/// genotype that an allele frequency does not give; the hemizygotes of the
+/// non-pseudoautosomal X are part of the allele count, so there the same doubling
+/// remains. On the benchmark it changes a call for 1,301 variants (BS1 and BS2
+/// without BA1), none of them a ClinVar pathogenic-side variant, and it was left
+/// as it was for that reason (`docs/ACMG.md`, limitation 29).
+///
+/// That is how a variant came to be called Benign on one frequency. TTR
+/// p.Val142Ile (722 gnomAD alleles) and VWF p.Arg854Gln (7,432), both ClinVar
+/// Pathogenic, went from VUS to Benign on BS1 and BS2 together the first time
+/// the classifier read ClinGen's curated inheritance and so reached the carrier
+/// arm for them (`docs/ACMG.md`, limitation 20). With the arm withheld beside
+/// BS1 they stay at VUS. A call made on a single observation counted twice reads
+/// as more certain than the evidence is, and that is the error this repository
+/// treats as the costlier one.
+///
+/// The carrier arm still acts below BS1's bar, which is the only place it adds
+/// anything: a dominant gene's carriers can exceed what a rare dominant disorder
+/// could account for at a frequency far under BS1's.
+fn suppress_bs2_carriers_beside_frequency(criteria: &mut [EvidenceCriterion]) {
+    let frequency_counted = criteria
+        .iter()
+        .any(|c| c.met && (is_criterion(&c.code, "BS1") || is_criterion(&c.code, "BA1")));
+    if !frequency_counted {
+        return;
+    }
+    for c in criteria.iter_mut() {
+        let carriers = c.met
+            && is_criterion(&c.code, "BS2")
+            && c.details.get("bs2_basis").and_then(|v| v.as_str()) == Some("carriers");
+        if carriers {
+            suppress(
+                c,
+                "Suppressed: BS1 or BA1 already counts the allele frequency this carrier count is made of; the same gnomAD observation is not a second criterion.",
+            );
+        }
     }
 }
 
@@ -614,6 +763,76 @@ mod reconcile_tests {
             summary: "test".to_string(),
             details: serde_json::Value::Object(details),
         }
+    }
+
+    fn bp4_with_source(source: &str) -> EvidenceCriterion {
+        let mut c = met(
+            "BP4",
+            EvidenceDirection::Benign,
+            EvidenceStrength::Supporting,
+        );
+        c.details = serde_json::json!({ "bp4_source": source });
+        c
+    }
+
+    #[test]
+    fn test_splice_bp4_does_not_count_against_a_damaging_missense_prediction() {
+        let mut criteria = vec![
+            pp3_with_source(EvidenceStrength::Supporting, "revel_missense"),
+            bp4_with_source("spliceai"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(find(&criteria, "PP3").met, "the missense evidence stands");
+        let bp4 = find(&criteria, "BP4");
+        assert!(!bp4.met);
+        assert!(
+            bp4.details["suppressed_by_reconcile"]
+                .as_str()
+                .is_some_and(|r| r.contains("Walker 2023")),
+            "{}",
+            bp4.details
+        );
+    }
+
+    /// PS1 or PM5 may take the PP3 away. The protein-level evidence they stand
+    /// for is no more answered by a splice prediction than the PP3 was.
+    #[test]
+    fn test_splice_bp4_is_still_dropped_when_ps1_takes_the_pp3_away() {
+        let mut criteria = vec![
+            met(
+                "PS1",
+                EvidenceDirection::Pathogenic,
+                EvidenceStrength::Strong,
+            ),
+            pp3_with_source(EvidenceStrength::Supporting, "revel_missense"),
+            bp4_with_source("spliceai"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(!find(&criteria, "PP3").met);
+        assert!(!find(&criteria, "BP4").met);
+    }
+
+    /// The mirror stays: a benign REVEL score is protein-level evidence, and a
+    /// SpliceAI-driven PP3 beside it is a genuine disagreement between the two
+    /// effects, which this pass does not adjudicate.
+    #[test]
+    fn test_revel_bp4_beside_a_splice_pp3_is_left_alone() {
+        let mut criteria = vec![
+            pp3_with_source(EvidenceStrength::Supporting, "spliceai"),
+            bp4_with_source("revel_missense"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(find(&criteria, "PP3").met);
+        assert!(find(&criteria, "BP4").met);
+    }
+
+    #[test]
+    fn test_splice_bp4_without_a_revel_pp3_is_left_alone() {
+        // No PP3 at all: a splice-assessable variant whose only computational
+        // evidence is SpliceAI saying nothing happens.
+        let mut criteria = vec![bp4_with_source("spliceai")];
+        reconcile_evidence(&mut criteria);
+        assert!(find(&criteria, "BP4").met);
     }
 
     fn find<'a>(criteria: &'a [EvidenceCriterion], code_prefix: &str) -> &'a EvidenceCriterion {
@@ -1077,5 +1296,105 @@ mod reconcile_tests {
         grade_ps1_splice_against_pvs1(&mut criteria);
         assert_eq!(criteria[1].strength, EvidenceStrength::Strong);
         assert!(criteria[1].summary.is_empty(), "{}", criteria[1].summary);
+    }
+
+    // ── Rule 7: BS2's carrier count beside BS1 or BA1 ──
+
+    fn bs2_with_basis(basis: &str) -> EvidenceCriterion {
+        let mut c = met("BS2", EvidenceDirection::Benign, EvidenceStrength::Strong);
+        c.details = serde_json::json!({ "bs2_basis": basis });
+        c
+    }
+
+    #[test]
+    fn test_bs2_carriers_are_not_counted_beside_bs1() {
+        let mut criteria = vec![
+            met("BS1", EvidenceDirection::Benign, EvidenceStrength::Strong),
+            bs2_with_basis("carriers"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(find(&criteria, "BS1").met, "the frequency criterion stands");
+        let bs2 = find(&criteria, "BS2");
+        assert!(!bs2.met);
+        assert!(
+            bs2.details["suppressed_by_reconcile"]
+                .as_str()
+                .is_some_and(|r| r.contains("BS1 or BA1")),
+            "{}",
+            bs2.details
+        );
+        assert!(bs2.summary.contains("Suppressed"), "{}", bs2.summary);
+    }
+
+    #[test]
+    fn test_bs2_carriers_are_not_counted_beside_ba1() {
+        let mut criteria = vec![
+            met(
+                "BA1",
+                EvidenceDirection::Benign,
+                EvidenceStrength::Standalone,
+            ),
+            bs2_with_basis("carriers"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(find(&criteria, "BA1").met);
+        assert!(!find(&criteria, "BS2").met);
+    }
+
+    #[test]
+    fn test_a_graded_bs1_still_counts_as_the_frequency() {
+        // A gene override can restrength BS1, which renames it.
+        let mut criteria = vec![
+            met(
+                "BS1_Supporting",
+                EvidenceDirection::Benign,
+                EvidenceStrength::Supporting,
+            ),
+            bs2_with_basis("carriers"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(!find(&criteria, "BS2").met);
+    }
+
+    #[test]
+    fn test_bs2_carriers_stand_where_bs1_did_not_fire() {
+        // The arm exists for the frequencies below BS1's bar, and there it is the
+        // only criterion saying so.
+        let mut criteria = vec![
+            not_met("BS1", EvidenceDirection::Benign, EvidenceStrength::Strong),
+            bs2_with_basis("carriers"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(find(&criteria, "BS2").met);
+
+        let mut alone = vec![bs2_with_basis("carriers")];
+        reconcile_evidence(&mut alone);
+        assert!(find(&alone, "BS2").met);
+    }
+
+    #[test]
+    fn test_bs2_homozygote_arm_is_a_different_observation_from_bs1() {
+        // Individuals with no working copy are not what allele frequency counts,
+        // so BS2's recessive arm is independent of BS1 and keeps firing beside it.
+        let mut criteria = vec![
+            met("BS1", EvidenceDirection::Benign, EvidenceStrength::Strong),
+            bs2_with_basis("null_individuals"),
+        ];
+        reconcile_evidence(&mut criteria);
+        assert!(find(&criteria, "BS1").met);
+        assert!(find(&criteria, "BS2").met);
+    }
+
+    #[test]
+    fn test_a_bs2_that_did_not_fire_is_left_alone() {
+        let mut declined = bs2_with_basis("carriers");
+        declined.met = false;
+        let mut criteria = vec![
+            met("BS1", EvidenceDirection::Benign, EvidenceStrength::Strong),
+            declined,
+        ];
+        reconcile_evidence(&mut criteria);
+        let bs2 = find(&criteria, "BS2");
+        assert!(bs2.details.get("suppressed_by_reconcile").is_none());
     }
 }

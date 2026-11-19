@@ -375,7 +375,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fastvep-annotate"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fastvep-cache",
@@ -386,8 +386,9 @@ dependencies = [
  "fastvep-hgvs",
  "fastvep-io",
  "fastvep-sa",
- "flate2",
+ "foldhash",
  "rayon",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",
@@ -395,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-cache"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -408,6 +409,7 @@ dependencies = [
  "noodles-core",
  "noodles-csi",
  "noodles-tabix",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
@@ -416,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-classification"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fastvep-core",
@@ -428,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -447,6 +449,7 @@ dependencies = [
  "fastvep-sa",
  "flate2",
  "log",
+ "mimalloc",
  "noodles-bgzf",
  "noodles-core",
  "noodles-csi",
@@ -459,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-consequence"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fastvep-core",
  "fastvep-genome",
@@ -468,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -476,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-filter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fastvep-core",
@@ -484,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-genome"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fastvep-core",
  "serde",
@@ -492,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-hgvs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fastvep-core",
  "fastvep-genome",
@@ -500,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-io"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fastvep-core",
@@ -514,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-oncogenicity"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fastvep-classification",
  "fastvep-core",
@@ -524,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-sa"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -544,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "fastvep-web"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -846,6 +849,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -894,6 +906,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]

@@ -35,7 +35,7 @@ use crate::sa_extract::ClassificationInput;
 /// that the relationship does not hold.
 ///
 /// The first version of this gate blocked on absence, and run v10 measured what
-/// that costs: **1,497 truth-pathogenic null variants lost PVS1**, in genes like
+/// that costs: **1,497 ClinVar-Pathogenic null variants lost PVS1**, in genes like
 /// SPAST, ABCB11, FLG and LAMB3 that cause disease and simply are not curated
 /// yet. The genes it was meant to catch (RYK, GIGYF2) are absent from ClinGen
 /// too, so absence-blocking was not even selecting for the right thing - it was
@@ -147,7 +147,7 @@ mod tests {
     fn test_gene_absent_from_the_source_never_blocks() {
         // The rule that matters most. ClinGen has curated ~2,400 genes, so a
         // gene it has not reached says nothing about the gene. Blocking on
-        // absence cost 1,497 truth-pathogenic PVS1 firings in run v10.
+        // absence cost 1,497 ClinVar-Pathogenic PVS1 firings in run v10.
         let input = minimal_input();
         assert!(input.omim.is_none());
         assert!(validity_blocker(&input, &AcmgConfig::default()).is_none());
@@ -332,5 +332,24 @@ mod tests {
         let (input, mut config) = with_mechanism("PCSK9", "GOF");
         config.mechanism_gates_pvs1 = false;
         assert!(lof_mechanism_blocker(&input, &config).is_none());
+    }
+
+    #[test]
+    fn test_a_label_split_on_a_semicolon_does_not_leak_past_the_gate() {
+        // NSMCE3's only ClinGen curation is Limited, and its label ends in ';'.
+        // The converter joins phenotypes with ';' and the reader splits on it,
+        // so the gene arrives as an untagged piece and a tagged one. The
+        // untagged piece used to count as an established disease and the gene
+        // was not withheld from PVS1, PP2 and PM1.
+        let input = with_phenotypes(&[
+            "immunodeficiency 49 and neutropenia;",
+            "NSMCE3-related (ClinGen Limited/AR, MONDO:0044118)",
+        ]);
+        let reason = validity_blocker(&input, &AcmgConfig::default())
+            .expect("a gene whose only curation is Limited must block");
+        assert!(
+            reason.contains("no_valid_gene_disease_relationship"),
+            "{reason}"
+        );
     }
 }

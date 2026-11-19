@@ -35,7 +35,7 @@ fn evaluate_pm1(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
     // exactly that stacking on CBS, MSH6 and RYR1 ("PM1 is called with PVS1?
     // Where is the evidence for PM1 coming?"). The PVS1 co-occurrence case is
     // additionally suppressed in the reconciliation pass.
-    let pm1_eligible_consequence = input.consequences.iter().any(|c| {
+    let has_eligible_term = input.consequences.iter().any(|c| {
         matches!(
             c,
             Consequence::MissenseVariant
@@ -46,6 +46,26 @@ fn evaluate_pm1(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
                 | Consequence::StartLost
         )
     });
+    // A change HGVS places wholly inside an intron beyond ±2 edits no exon base,
+    // so there is no residue for a hotspot to say anything about, whatever term
+    // its record's anchor produced. PM4 and BP3 stand down for the same reason.
+    // See `ClassificationInput::placed_beyond_canonical_splice`.
+    if has_eligible_term && input.placed_beyond_canonical_splice() {
+        if let Some(placement) = input.hgvs_placement {
+            details.insert("hgvs_placement".into(), super::placement_detail(placement));
+        }
+        return EvidenceCriterion {
+            code: "PM1".to_string(),
+            direction: EvidenceDirection::Pathogenic,
+            strength: EvidenceStrength::Moderate,
+            default_strength: EvidenceStrength::Moderate,
+            met: false,
+            evaluated: true,
+            summary: "HGVS places the change wholly inside an intron beyond the canonical ±1/±2 dinucleotides: it alters no exon base, so the protein-altering term describes how the record is anchored and there is no residue for PM1's hotspot to describe".to_string(),
+            details: serde_json::Value::Object(details),
+        };
+    }
+    let pm1_eligible_consequence = has_eligible_term;
     if !pm1_eligible_consequence {
         return EvidenceCriterion {
             code: "PM1".to_string(),
@@ -238,18 +258,23 @@ fn evaluate_pm1(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
     }
 }
 
-/// PM2: Absent from controls (or at extremely low frequency if recessive).
+/// PM2: Absent from controls, or at extremely low frequency.
 ///
-/// Per ClinGen SVI v1.0 (Sept 2020):
-/// - Strength is Supporting (downgraded from Moderate by default).
+/// ClinGen SVI PM2 v1.0 (Sept 2020) downgrades the strength to Supporting (the default
+/// here) and gives no frequency for any inheritance. The bars are this project's
+/// choice, and the recessive-only one equals the Hearing Loss VCEP's (GN005):
 /// - Use raw gnomAD allele frequency (NOT filtering allele frequency / FAF).
-/// - Threshold depends on inheritance:
-///     * AD / unknown: strict absence (AC = 0 or AF = 0).
-///     * AR: AF ≤ 0.00007 (0.007%).
+/// - The bar depends on inheritance:
+///     * every gene not read as recessive-only (dominant, both, unknown):
+///       `pm2_ad_af_threshold`, 4e-5 by default;
+///     * a gene read as recessive-only: `pm2_ar_af_threshold`, 7e-5 by default.
 ///
-/// Inheritance is inferred from OMIM phenotypes (`OmimData::has_recessive_inheritance` /
-/// `has_dominant_inheritance`). When a per-gene `pm2_af_threshold` override is
-/// configured, that value wins regardless of inheritance.
+/// Both bars were swept for the ACMG manuscript (`manuscript/acmg`, Section 3.3).
+///
+/// Inheritance is read from the gene's disease annotation (`OmimData::inheritance`):
+/// ClinGen's curated mode of inheritance for a ClinGen curation, and the words of
+/// the phenotype for a legacy OMIM one. When a per-gene `pm2_af_threshold`
+/// override is configured, that value wins regardless of inheritance.
 fn evaluate_pm2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCriterion {
     // "Absent from population databases" is only evidence when the database
     // could have seen the variant. Where reads pile up on a paralogue, or
@@ -294,7 +319,7 @@ fn evaluate_pm2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
     // Determine the effective threshold and which inheritance rule applied.
     // Order of precedence:
     //   1. Per-gene override (config.gene_overrides[GENE].pm2_af_threshold)
-    //   2. AR inheritance (from OMIM) → config.pm2_ar_af_threshold
+    //   2. AR inheritance (curated by ClinGen, or from an OMIM phenotype) → config.pm2_ar_af_threshold
     //   3. AD or unknown → config.pm2_ad_af_threshold (default 0.0 = strict absence)
     //
     // The legacy single-threshold field `config.pm2_af_threshold` is kept as a
@@ -307,14 +332,13 @@ fn evaluate_pm2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
             .and_then(|o| o.pm2_af_threshold)
     });
 
-    let is_recessive = input
+    // One read of the gene's diseases for both flags.
+    let inheritance = input
         .omim
         .as_ref()
-        .is_some_and(|o| o.has_recessive_inheritance());
-    let is_dominant = input
-        .omim
-        .as_ref()
-        .is_some_and(|o| o.has_dominant_inheritance());
+        .map(|o| o.inheritance())
+        .unwrap_or_default();
+    let (is_recessive, is_dominant) = (inheritance.recessive, inheritance.dominant);
 
     let (threshold, inheritance_basis): (f64, &'static str) =
         if let Some(t) = gene_specific_threshold {
@@ -492,7 +516,8 @@ fn evaluate_pm2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
 /// | ≥ 4.0 | PM3_VeryStrong |
 ///
 /// Companions in cis with a pathogenic variant are excluded (those count
-/// toward BP2 instead). Requires AR inheritance from OMIM.
+/// toward BP2 instead). Requires recessive inheritance in the gene's disease
+/// annotation (ClinGen's curated `AR` or `SD`, or the words of an OMIM phenotype).
 fn evaluate_pm3(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
     let mut details = serde_json::Map::new();
 
@@ -650,14 +675,24 @@ fn mk_pm3(
 /// PM4: Protein length changes due to in-frame deletions/insertions in non-repeat region,
 /// or stop-loss variants.
 fn evaluate_pm4(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
-    let is_length_change = input.consequences.iter().any(|c| {
+    let has_length_term = input.consequences.iter().any(|c| {
         matches!(
             c,
             Consequence::InframeInsertion | Consequence::InframeDeletion | Consequence::StopLost
         )
     });
+    // A change HGVS places wholly inside an intron beyond ±2 edits no exon base,
+    // so the protein is unchanged whatever length term its record's anchor
+    // produced. See `ClassificationInput::placed_beyond_canonical_splice`.
+    let placed_in_intron = input.placed_beyond_canonical_splice();
+    let is_length_change = has_length_term && !placed_in_intron;
 
     let mut details = serde_json::Map::new();
+    if has_length_term && placed_in_intron {
+        if let Some(placement) = input.hgvs_placement {
+            details.insert("hgvs_placement".into(), super::placement_detail(placement));
+        }
+    }
     if is_length_change {
         let types: Vec<&str> = input
             .consequences
@@ -677,6 +712,8 @@ fn evaluate_pm4(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCr
 
     let summary = if is_length_change {
         "Protein length-changing variant (in-frame indel or stop-loss)".to_string()
+    } else if has_length_term {
+        "HGVS places the change wholly inside an intron beyond the canonical ±1/±2 dinucleotides: it alters no exon base, so the in-frame or stop-loss term describes how the record is anchored and the protein length is unchanged".to_string()
     } else {
         "Not a protein length-changing variant".to_string()
     };
@@ -1001,6 +1038,94 @@ mod tests {
             gnomad,
             ..minimal_input()
         }
+    }
+
+    /// PM4 asks whether the protein changes length. A change HGVS places wholly
+    /// inside an intron past ±2 edits no exon base, so whatever length term its
+    /// record's anchor produced, it does not.
+    #[test]
+    fn test_pm4_does_not_apply_to_a_length_term_placed_wholly_in_the_intron() {
+        use fastvep_core::HgvsPlacement;
+        let config = AcmgConfig::default();
+        for term in [
+            Consequence::InframeInsertion,
+            Consequence::InframeDeletion,
+            Consequence::StopLost,
+        ] {
+            let mut input = make_input(vec![term], None);
+            assert!(evaluate_pm4(&input, &config).met, "{term:?} as anchored");
+
+            input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 8 });
+            let placed = evaluate_pm4(&input, &config);
+            assert!(!placed.met, "{term:?} placed in the intron");
+            assert!(placed.evaluated);
+            assert!(placed.summary.contains("intron"), "{}", placed.summary);
+            assert_eq!(
+                placed.details["hgvs_placement"],
+                serde_json::json!({"kind": "intronic", "offset": 8})
+            );
+
+            // Inconclusive, or on the dinucleotide: the term decides.
+            for placement in [
+                HgvsPlacement::Spans,
+                HgvsPlacement::Exonic { in_frame: true },
+                HgvsPlacement::Intronic { offset: 2 },
+            ] {
+                input.hgvs_placement = Some(placement);
+                assert!(evaluate_pm4(&input, &config).met, "{term:?} {placement:?}");
+            }
+        }
+    }
+
+    /// PM1 is residue-level evidence, and a change HGVS places wholly inside an
+    /// intron past ±2 edits no residue, whatever protein-altering term its
+    /// record's anchor produced. PM4 and BP3 stand down for the same placement.
+    #[test]
+    fn test_pm1_does_not_apply_to_a_protein_term_placed_wholly_in_the_intron() {
+        use fastvep_core::HgvsPlacement;
+        let config = AcmgConfig::default();
+        let hotspot = |term| {
+            let mut input = hotspot_missense("ARMC9");
+            input.consequences = vec![term];
+            input
+        };
+        for term in [
+            Consequence::InframeInsertion,
+            Consequence::InframeDeletion,
+            Consequence::ProteinAlteringVariant,
+            Consequence::StopLost,
+            Consequence::StartLost,
+        ] {
+            let mut input = hotspot(term);
+            assert!(evaluate_pm1(&input, &config).met, "{term:?} as anchored");
+
+            input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 8 });
+            let placed = evaluate_pm1(&input, &config);
+            assert!(!placed.met, "{term:?} placed in the intron");
+            assert!(placed.evaluated);
+            assert!(placed.summary.contains("intron"), "{}", placed.summary);
+            assert_eq!(
+                placed.details["hgvs_placement"],
+                serde_json::json!({"kind": "intronic", "offset": 8})
+            );
+
+            // Inconclusive, wholly in an exon, or on the dinucleotide: the term decides.
+            for placement in [
+                HgvsPlacement::Spans,
+                HgvsPlacement::Exonic { in_frame: true },
+                HgvsPlacement::Intronic { offset: 2 },
+            ] {
+                input.hgvs_placement = Some(placement);
+                assert!(evaluate_pm1(&input, &config).met, "{term:?} {placement:?}");
+            }
+        }
+        // A term PM1 never reads has nothing to explain.
+        let mut frameshift = hotspot(Consequence::FrameshiftVariant);
+        frameshift.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 8 });
+        let result = evaluate_pm1(&frameshift, &config);
+        assert!(!result.met);
+        assert!(result.summary.contains("missense and in-frame"));
+        assert!(result.details.get("hgvs_placement").is_none());
     }
 
     #[test]
@@ -1420,11 +1545,11 @@ mod tests {
             gene_symbol: Some(gene.to_string()),
             protein_position: Some(100),
             amino_acids: Some(("A".into(), "T".into())),
-            clinvar_protein: Some(ClinvarProteinData {
+            clinvar_protein: Some(std::sync::Arc::new(ClinvarProteinData {
                 protein_variants: neighbours,
                 benign_indexed: true,
                 ..Default::default()
-            }),
+            })),
             ..minimal_input()
         }
     }
@@ -1480,7 +1605,8 @@ mod tests {
     /// Add `n` benign missense entries inside PM1's window.
     fn with_benign_neighbours(mut input: ClassificationInput, n: u64) -> ClassificationInput {
         use crate::sa_extract::ClinvarProteinVariant;
-        let cpd = input.clinvar_protein.as_mut().expect("helper builds one");
+        let cpd =
+            std::sync::Arc::make_mut(input.clinvar_protein.as_mut().expect("helper builds one"));
         for i in 0..n {
             cpd.protein_variants.push(ClinvarProteinVariant {
                 pos: 100 + i,
@@ -1534,7 +1660,7 @@ mod tests {
         // them, not because the gene has none. Testing anyway would pass every
         // window and read as evidence that was never gathered.
         let mut input = hotspot_missense("CHD7");
-        input.clinvar_protein.as_mut().unwrap().benign_indexed = false;
+        std::sync::Arc::make_mut(input.clinvar_protein.as_mut().unwrap()).benign_indexed = false;
         let r = evaluate_pm1(&input, &AcmgConfig::default());
         assert!(r.met);
         assert!(
@@ -1569,10 +1695,7 @@ mod tests {
         use crate::sa_extract::ClinvarProteinVariant;
         let mut input = hotspot_missense("CHD7");
         let window = AcmgConfig::default().pm1_hotspot_window;
-        input
-            .clinvar_protein
-            .as_mut()
-            .unwrap()
+        std::sync::Arc::make_mut(input.clinvar_protein.as_mut().unwrap())
             .protein_variants
             .push(ClinvarProteinVariant {
                 pos: 100 + window + 1,
@@ -1582,5 +1705,116 @@ mod tests {
                 n: 1,
             });
         assert!(evaluate_pm1(&input, &AcmgConfig::default()).met);
+    }
+
+    // ── Inheritance is read from ClinGen's curated field ──
+
+    /// A variant at `af` in a gene with these phenotypes, the labels of which say
+    /// nothing about inheritance.
+    fn at_in_gene(af: f64, phenotypes: &[&str]) -> ClassificationInput {
+        let mut input = make_input(
+            vec![Consequence::MissenseVariant],
+            Some(GnomadData {
+                all_af: Some(af),
+                all_ac: Some(2),
+                ..Default::default()
+            }),
+        );
+        input.omim = Some(OmimData {
+            mim_number: None,
+            phenotypes: Some(phenotypes.iter().map(|s| s.to_string()).collect()),
+        });
+        input
+    }
+
+    /// PAH's ClinGen curation is "phenylketonuria", tagged AR. The label does not
+    /// say recessive, and before the tag was read PM2 applied the dominant bar to
+    /// it and withheld PM2 from every variant between 4e-5 and 7e-5.
+    #[test]
+    fn test_pm2_takes_the_recessive_bar_from_the_curated_tag() {
+        let config = AcmgConfig::default();
+        let ar = evaluate_pm2(
+            &at_in_gene(
+                6e-5,
+                &["phenylketonuria (ClinGen Definitive/AR, MONDO:0009861)"],
+            ),
+            &config,
+        );
+        assert!(ar.met, "{}", ar.summary);
+        assert_eq!(ar.details["inheritance_basis"], serde_json::json!("AR"));
+
+        // The same frequency in an AD gene is above its bar.
+        let ad = evaluate_pm2(
+            &at_in_gene(
+                6e-5,
+                &["Kabuki syndrome 1 (ClinGen Definitive/AD, MONDO:0008624)"],
+            ),
+            &config,
+        );
+        assert!(!ad.met, "{}", ad.summary);
+        assert_eq!(
+            ad.details["inheritance_basis"],
+            serde_json::json!("AD_or_unknown")
+        );
+    }
+
+    #[test]
+    fn test_pm2_a_gene_that_is_both_takes_the_strict_bar() {
+        // A gene with an AD disease and an AR one is not "recessive only". The
+        // per-disorder results answer each; the headline stays cautious.
+        let result = evaluate_pm2(
+            &at_in_gene(
+                6e-5,
+                &[
+                    "breast cancer (ClinGen Definitive/AD, MONDO:1)",
+                    "Fanconi anemia (ClinGen Definitive/AR, MONDO:2)",
+                ],
+            ),
+            &AcmgConfig::default(),
+        );
+        assert!(!result.met, "{}", result.summary);
+        assert_eq!(
+            result.details["inheritance_basis"],
+            serde_json::json!("AD_or_unknown")
+        );
+    }
+
+    #[test]
+    fn test_pm2_x_linked_and_semidominant_genes_take_the_strict_bar() {
+        // `XL` does not say dominant or recessive, and `SD` is dominant as well
+        // as recessive: neither is "recessive only".
+        for code in ["XL", "SD", "MT", "UD"] {
+            let phenotype = format!("a disease (ClinGen Definitive/{code}, MONDO:1)");
+            let result = evaluate_pm2(
+                &at_in_gene(6e-5, &[phenotype.as_str()]),
+                &AcmgConfig::default(),
+            );
+            assert!(!result.met, "{code}: {}", result.summary);
+        }
+    }
+
+    #[test]
+    fn test_pm3_recognises_a_recessive_gene_by_its_curated_inheritance() {
+        let mut input = make_input(vec![Consequence::MissenseVariant], None);
+        input.omim = Some(OmimData {
+            mim_number: None,
+            phenotypes: Some(vec![
+                "phenylketonuria (ClinGen Definitive/AR, MONDO:0009861)".into(),
+            ]),
+        });
+        let result = evaluate_pm3(&input, &AcmgConfig::default());
+        assert_eq!(result.details["is_recessive_gene"], serde_json::json!(true));
+
+        input.omim = Some(OmimData {
+            mim_number: None,
+            phenotypes: Some(vec![
+                "Kabuki syndrome 1 (ClinGen Definitive/AD, MONDO:0008624)".into(),
+            ]),
+        });
+        let result = evaluate_pm3(&input, &AcmgConfig::default());
+        assert_eq!(
+            result.details["is_recessive_gene"],
+            serde_json::json!(false)
+        );
     }
 }

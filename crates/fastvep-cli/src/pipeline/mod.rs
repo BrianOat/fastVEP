@@ -5,9 +5,8 @@
 //! keeps only what more than one command needs.
 
 use anyhow::{Context, Result};
-use flate2::read::MultiGzDecoder;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 
 pub mod annotate;
 pub mod cache_build;
@@ -15,14 +14,17 @@ pub mod custom;
 pub mod filter;
 pub mod sa_build;
 
-pub use annotate::{run_annotate, AnnotateConfig};
+pub use annotate::{run_annotate, AnnotateConfig, CompatFlags, TranscriptExclusions};
 pub use cache_build::{parse_gff3_arg, run_cache_build, Gff3Spec};
 pub use custom::run_oga_build;
+pub use fastvep_io::output::ColumnFlags;
 pub use filter::run_filter;
 // `pick` moved into `fastvep-annotate` so the CLI and the web server
 // share one implementation; re-exported here so callers of
 // `pipeline::` keep the path they had.
-pub use fastvep_annotate::pick::{parse_pick_order, PickCriterion, DEFAULT_PICK_ORDER};
+pub use fastvep_annotate::pick::{
+    parse_pick_order, PickCriterion, PickFlags, PickMode, PickScope, DEFAULT_PICK_ORDER,
+};
 pub use sa_build::{
     run_sa_build, run_sa_build_format, run_sa_build_v2, run_sa_convert, source_from_json_key,
     source_has_decomposed_osa2, source_supports_osa2, OSA2_DECOMPOSED_SOURCES,
@@ -40,17 +42,8 @@ pub(crate) fn open_vcf_input_reader(input: &str) -> Result<Box<dyn io::Read>> {
 }
 
 pub(crate) fn wrap_maybe_gzip_reader(
-    mut reader: Box<dyn io::Read>,
+    reader: Box<dyn io::Read>,
     source: &str,
 ) -> Result<Box<dyn io::Read>> {
-    let mut prefix = [0u8; 2];
-    let bytes_read = reader.read(&mut prefix)?;
-    let looks_like_gzip = bytes_read == 2 && prefix == [0x1f, 0x8b];
-
-    let replay = io::Cursor::new(prefix[..bytes_read].to_vec()).chain(reader);
-    if looks_like_gzip || (source != "-" && source.ends_with(".gz")) {
-        Ok(Box::new(MultiGzDecoder::new(replay)))
-    } else {
-        Ok(Box::new(replay))
-    }
+    fastvep_cache::gzip::wrap_maybe_gzip(reader, source)
 }

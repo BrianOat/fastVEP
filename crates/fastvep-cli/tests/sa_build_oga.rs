@@ -4,7 +4,7 @@
 //! `run_sa_build` (the same entrypoint the CLI uses), and reads the resulting
 //! database back to confirm the round-trip.
 
-use fastvep_cli::pipeline::{run_annotate, run_sa_build, AnnotateConfig};
+use fastvep_cli::pipeline::{run_annotate, run_sa_build, AnnotateConfig, PickFlags};
 use fastvep_sa::gene::GeneIndex;
 use std::fs::{self, File};
 use std::io::Write;
@@ -263,7 +263,7 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -281,6 +281,9 @@ fn annotate_vcf_emits_spliceai_from_fastsa() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -366,7 +369,7 @@ chr1\t26011\t2.71
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -384,6 +387,9 @@ chr1\t26011\t2.71
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -448,7 +454,7 @@ fn annotate_vcf_replaces_existing_fastvep_info() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -466,6 +472,9 @@ fn annotate_vcf_replaces_existing_fastvep_info() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -519,7 +528,7 @@ fn annotate_vcf_emits_fastsa_projection_for_gnomad() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -537,6 +546,9 @@ fn annotate_vcf_emits_fastsa_projection_for_gnomad() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -589,7 +601,7 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -607,6 +619,9 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -646,7 +661,7 @@ fn annotate_tab_emits_fastsa_columns_for_clinvar_and_gnomad() {
     let cols: Vec<&str> = pos25k.split('\t').collect();
     assert_eq!(cols.len(), 17 + 2);
     assert_eq!(
-        cols[17], "G|Pathogenic|criteria_provided%2C_multiple_submitters%2C_no_conflicts|Breast_cancer|SNV|SO%3A0001483",
+        cols[17], "G|Pathogenic|criteria_provided%2C_multiple_submitters%2C_no_conflicts|Breast_cancer|SNV|SO:0001483",
         "FV_CLINVAR tab column must match the VCF pipe schema: {}",
         pos25k
     );
@@ -701,7 +716,7 @@ fn write_clinvar_fixture(tmp: &std::path::Path) {
 
 #[test]
 fn sa_only_vcf_omits_csq_and_default_pipeline() {
-    // --sa-only must skip the default 51-field CSQ annotation entirely:
+    // --sa-only must skip the default 49-field CSQ annotation entirely:
     // no ##INFO=<ID=CSQ> header, no CSQ= INFO field on any data row.
     // FV_CLINVAR (and any other --sa-dir-loaded source) still emits.
     let tmp = tempfile::tempdir().unwrap();
@@ -716,7 +731,7 @@ fn sa_only_vcf_omits_csq_and_default_pipeline() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -734,6 +749,9 @@ fn sa_only_vcf_omits_csq_and_default_pipeline() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -780,7 +798,7 @@ fn sa_only_tab_emits_minimal_columns() {
         gff3: vec![],
         fasta: None,
         output_format: "tab".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -798,6 +816,9 @@ fn sa_only_tab_emits_minimal_columns() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -832,7 +853,7 @@ fn sa_only_tab_emits_minimal_columns() {
     assert_eq!(cols[2], "G");
     assert_eq!(
         cols[3],
-        "G|Pathogenic|criteria_provided%2C_multiple_submitters%2C_no_conflicts|Breast_cancer|SNV|SO%3A0001483"
+        "G|Pathogenic|criteria_provided%2C_multiple_submitters%2C_no_conflicts|Breast_cancer|SNV|SO:0001483"
     );
 }
 
@@ -852,7 +873,7 @@ fn sa_only_json_omits_transcript_consequences() {
         gff3: vec![],
         fasta: None,
         output_format: "json".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -870,6 +891,9 @@ fn sa_only_json_omits_transcript_consequences() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -952,7 +976,7 @@ fn sa_only_requires_sa_dir() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -970,6 +994,9 @@ fn sa_only_requires_sa_dir() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .expect_err("--sa-only without --sa-dir must error");
@@ -1023,7 +1050,7 @@ fn sa_only_multi_allelic_emits_per_alt_rows_with_independent_sa_columns() {
         gff3: vec![],
         fasta: None,
         output_format: "tab".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -1041,6 +1068,9 @@ fn sa_only_multi_allelic_emits_per_alt_rows_with_independent_sa_columns() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -1102,7 +1132,7 @@ fn sa_only_strips_preexisting_csq_from_input_info() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -1120,6 +1150,9 @@ fn sa_only_strips_preexisting_csq_from_input_info() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -1175,7 +1208,7 @@ fn sa_only_strips_csq_when_in_middle_of_info_field() {
         gff3: vec![],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -1193,6 +1226,9 @@ fn sa_only_strips_csq_when_in_middle_of_info_field() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -1272,7 +1308,7 @@ fn intergenic_variant_with_sa_dir_in_default_mode_emits_fv_clinvar() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -1290,6 +1326,9 @@ fn intergenic_variant_with_sa_dir_in_default_mode_emits_fv_clinvar() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -1335,7 +1374,7 @@ fn annotate_tab_gene_list_filters_to_panel_genes() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -1353,6 +1392,9 @@ fn annotate_tab_gene_list_filters_to_panel_genes() {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -1390,7 +1432,7 @@ fn annotate_tab_explicit_alleles_inserts_ref_column() {
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -1408,6 +1450,9 @@ fn annotate_tab_explicit_alleles_inserts_ref_column() {
         explicit_alleles: true,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -1477,7 +1522,7 @@ min_dp = 8
         gff3: vec![gff3.to_string_lossy().into_owned()],
         fasta: None,
         output_format: "tab".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
         distance: 0,
         cache_dir: None,
@@ -1495,6 +1540,9 @@ min_dp = 8
         explicit_alleles: false,
         qc_rules: Some(qc_rules_path.to_string_lossy().into_owned()),
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .unwrap();
@@ -1531,4 +1579,71 @@ min_dp = 8
         "DP=5 falls below LOW_QC threshold (min_dp=8) → fallback: {}",
         row_30k
     );
+}
+
+#[test]
+fn sa_only_does_not_declare_a_pick_column_for_the_switch_it_ignores() {
+    // `--sa-only` warns that it is ignoring `--flag-pick*` and skips the pick
+    // entirely, but the CSQ field list and the tab header were derived from
+    // the switch alone - so the run declared a `PICK` column that was empty on
+    // every row. An empty column asserts "this entry lost the pick", which is
+    // a claim about a pick the run just said it did not make.
+    let tmp = tempfile::tempdir().unwrap();
+    let input_vcf = tmp.path().join("input.vcf");
+    let output_tab = tmp.path().join("annotated.tsv");
+    fs::write(&input_vcf, INPUT_NO_SPLICEAI_INFO_VCF).unwrap();
+    write_clinvar_fixture(tmp.path());
+
+    run_annotate(AnnotateConfig {
+        input: input_vcf.to_string_lossy().into_owned(),
+        output: output_tab.to_string_lossy().into_owned(),
+        gff3: vec![],
+        fasta: None,
+        output_format: "tab".into(),
+        pick: PickFlags {
+            flag_pick_allele_gene: true,
+            ..PickFlags::default()
+        },
+        hgvs: false,
+        distance: 0,
+        cache_dir: None,
+        transcript_cache: None,
+        sa_dir: Some(tmp.path().to_string_lossy().into_owned()),
+        sa_only: true,
+        acmg: false,
+        somatic: false,
+        acmg_config: None,
+        pick_order: None,
+        functional_evidence: None,
+        proband: None,
+        mother: None,
+        father: None,
+        gene_list: None,
+        explicit_alleles: false,
+        qc_rules: None,
+        show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
+    })
+    .expect("sa-only annotation should succeed");
+
+    let annotated = fs::read_to_string(&output_tab).unwrap();
+    let header = annotated
+        .lines()
+        .find(|l| l.starts_with("#Uploaded_variation"))
+        .unwrap_or_else(|| panic!("no tab header in:\n{annotated}"));
+    assert!(
+        !header.split('\t').any(|c| c == "PICK"),
+        "sa-only ignores the switch, so it must not declare the column: {header}"
+    );
+    // And every row still matches the header it declared.
+    let columns = header.split('\t').count();
+    for row in annotated.lines().filter(|l| !l.starts_with('#')) {
+        assert_eq!(
+            row.split('\t').count(),
+            columns,
+            "row does not match the {columns}-column header: {row}"
+        );
+    }
 }

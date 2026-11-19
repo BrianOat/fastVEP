@@ -32,7 +32,9 @@ pub fn evaluate_all(input: &ClassificationInput, config: &AcmgConfig) -> Vec<Evi
 ///    which holds only missense entries: a gene with
 ///    `bp1_max_pathogenic_missense` or more pathogenic/likely-pathogenic
 ///    missense records does have a missense mechanism, and BP1 cannot apply
-///    to it no matter what the constraint metrics say.
+///    to it no matter what the constraint metrics say. The count includes the
+///    variant's own record when ClinVar calls it pathogenic, which PS1 and PM1
+///    exclude (3 missed diagnoses on the ClinVar 2-star+ benchmark rest on it).
 ///
 /// Condition 2 was missing before the round-2 medical-genetics review, which
 /// found BP1 firing on ENG, CFH, FGFR3, APC, ANKRD11, PKD1 and a dozen more
@@ -142,6 +144,12 @@ fn evaluate_bp1(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
 ///
 /// Two triggers:
 /// 1. Dominant disorders: variant is in trans with a ClinVar pathogenic variant (phased).
+///    The gene's established diseases must be dominant and none of them recessive: a gene
+///    that also has a recessive disease (an AD and an AR curation, or a semidominant one)
+///    explains the same observation as the evidence PM3 counts for that disease, and BP2
+///    would count the companion against it. This is the reading of BS2's carrier arm, and
+///    not the "any recessive disease" that PM3 asks: PM3 is evidence about the variant, and
+///    BP2 is an exclusion that holds only if nothing else explains what was seen.
 /// 2. Any inheritance: variant is in cis with a ClinVar pathogenic variant (phased).
 fn evaluate_bp2(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
     let mut details = serde_json::Map::new();
@@ -159,11 +167,13 @@ fn evaluate_bp2(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCr
         };
     }
 
-    let is_dominant = input
-        .omim
-        .as_ref()
-        .is_some_and(|o| o.has_dominant_inheritance());
-    details.insert("is_dominant_gene".into(), serde_json::json!(is_dominant));
+    let (dominant, recessive) = input.omim.as_ref().map_or((false, false), |o| {
+        let inheritance = o.inheritance();
+        (inheritance.dominant, inheritance.recessive)
+    });
+    let is_dominant = dominant && !recessive;
+    details.insert("is_dominant_gene".into(), serde_json::json!(dominant));
+    details.insert("is_recessive_gene".into(), serde_json::json!(recessive));
 
     // Check for in-cis with pathogenic (any inheritance pattern)
     let in_cis_pathogenic: Vec<&crate::sa_extract::CompanionVariant> = input
@@ -221,7 +231,7 @@ fn evaluate_bp2(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCr
         };
     }
 
-    // Trigger 2: In trans with pathogenic in dominant gene
+    // Trigger 2: In trans with pathogenic in a gene whose established diseases are dominant only
     if is_dominant && !in_trans_pathogenic.is_empty() {
         return EvidenceCriterion {
             code: "BP2".to_string(),
@@ -267,18 +277,36 @@ fn evaluate_bp2(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCr
 ///
 /// Uses RepeatMasker interval annotations when available.
 fn evaluate_bp3(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCriterion {
-    let is_inframe_indel = input.consequences.iter().any(|c| {
+    let has_inframe_term = input.consequences.iter().any(|c| {
         matches!(
             c,
             Consequence::InframeInsertion | Consequence::InframeDeletion
         )
     });
+    // A change HGVS places wholly inside an intron beyond ±2 edits no exon base,
+    // so there is no in-frame protein change for BP3 to describe whatever its
+    // record's anchor produced. See
+    // `ClassificationInput::placed_beyond_canonical_splice`.
+    let placed_in_intron = input.placed_beyond_canonical_splice();
+    let is_inframe_indel = has_inframe_term && !placed_in_intron;
 
     let mut details = serde_json::Map::new();
     details.insert(
         "is_inframe_indel".into(),
         serde_json::json!(is_inframe_indel),
     );
+    // Say why a term that reads as in-frame was set aside, so that the record's
+    // `inframe_*` term and BP3's "not an in-frame indel" are not left
+    // contradicting each other with nothing to explain it.
+    let stood_down = has_inframe_term && placed_in_intron;
+    if let Some(placement) = input.hgvs_placement.filter(|_| stood_down) {
+        details.insert("hgvs_placement".into(), super::placement_detail(placement));
+    }
+    let not_an_inframe_indel = if stood_down {
+        "HGVS places the change wholly inside an intron beyond the canonical ±1/±2 dinucleotides: it alters no exon base, so the in-frame term describes how the record is anchored and there is no in-frame protein change for BP3 to describe"
+    } else {
+        "Not an in-frame insertion or deletion"
+    };
 
     if let Some(in_repeat) = input.in_repeat_region {
         details.insert("in_repeat_region".into(), serde_json::json!(in_repeat));
@@ -288,7 +316,7 @@ fn evaluate_bp3(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCr
         } else if is_inframe_indel && !in_repeat {
             "In-frame indel but not in a repetitive region".to_string()
         } else {
-            "Not an in-frame insertion or deletion".to_string()
+            not_an_inframe_indel.to_string()
         };
 
         EvidenceCriterion {
@@ -306,7 +334,7 @@ fn evaluate_bp3(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCr
             "In-frame indel detected, but repeat region data not available (load RepeatMasker .osi)"
                 .to_string()
         } else {
-            "Not an in-frame insertion or deletion".to_string()
+            not_an_inframe_indel.to_string()
         };
 
         EvidenceCriterion {
@@ -411,17 +439,29 @@ fn evaluate_bp4(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
     // still LOF, not benign. Pre-gate fixed a real false-positive where
     // BP4 was firing alongside PVS1 on ~5K frameshift Pathogenic
     // variants in the ClinVar 2-star+ benchmark.
-    let is_pvs1_territory = input.consequences.iter().any(|c| {
-        matches!(
-            c,
-            Consequence::FrameshiftVariant
-                | Consequence::StopGained
-                | Consequence::StartLost
-                | Consequence::TranscriptAblation
-                | Consequence::SpliceDonorVariant
-                | Consequence::SpliceAcceptorVariant
-        )
-    });
+    //
+    // Both gates below read the record's consequence terms, which describe how
+    // it is anchored. A change HGVS places wholly inside an intron beyond ±2
+    // edits no exon base and no canonical dinucleotide, so for it those terms
+    // are not a PVS1-territory or protein-altering effect, and the variant is
+    // as splice-assessable as any other intronic one. See
+    // `ClassificationInput::placed_beyond_canonical_splice`.
+    let placed_in_intron = input.placed_beyond_canonical_splice();
+    if let Some(placement) = input.hgvs_placement.filter(|_| placed_in_intron) {
+        details.insert("hgvs_placement".into(), super::placement_detail(placement));
+    }
+    let is_pvs1_territory = !placed_in_intron
+        && input.consequences.iter().any(|c| {
+            matches!(
+                c,
+                Consequence::FrameshiftVariant
+                    | Consequence::StopGained
+                    | Consequence::StartLost
+                    | Consequence::TranscriptAblation
+                    | Consequence::SpliceDonorVariant
+                    | Consequence::SpliceAcceptorVariant
+            )
+        });
     // Walker 2023 BP4-splice applies only where splicing is plausibly the
     // question. A deep-exonic missense whose predicted effect is the
     // amino-acid change is assessed by REVEL, not SpliceAI: a low SpliceAI
@@ -445,15 +485,17 @@ fn evaluate_bp4(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
     // BS2, reached Likely Benign on genuinely pathogenic variants (AFG2A,
     // RSPH9, AMHR2, OCA2, CYP24A1 in the round-2 review). A variant that also
     // overlaps a splice region stays splice-assessable.
-    let is_uncalibrated_coding = input.consequences.iter().any(|c| {
-        matches!(
-            c,
-            Consequence::InframeInsertion
-                | Consequence::InframeDeletion
-                | Consequence::StopLost
-                | Consequence::ProteinAlteringVariant
-        )
-    }) && !overlaps_splice_region;
+    let is_uncalibrated_coding = !placed_in_intron
+        && input.consequences.iter().any(|c| {
+            matches!(
+                c,
+                Consequence::InframeInsertion
+                    | Consequence::InframeDeletion
+                    | Consequence::StopLost
+                    | Consequence::ProteinAlteringVariant
+            )
+        })
+        && !overlaps_splice_region;
     let splice_supporting = if is_uncalibrated_coding {
         details.insert(
             "splice_skipped_reason".into(),
@@ -504,6 +546,16 @@ fn evaluate_bp4(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
         (false, true) => (true, EvidenceStrength::Supporting),
         (false, false) => (false, EvidenceStrength::Supporting),
     };
+    // Which evidence carried it, for the reconciliation pass, which has to tell
+    // a splice-only BP4 from a REVEL one: see `reconcile_evidence`.
+    details.insert(
+        "bp4_source".into(),
+        serde_json::json!(match (revel_met, splice_supporting) {
+            (true, _) => "revel_missense",
+            (false, true) => "spliceai",
+            (false, false) => "none",
+        }),
+    );
 
     let evaluated = (is_missense && input.revel.is_some()) || input.splice_ai.is_some();
     details.insert("evidence_lines".into(), serde_json::json!(evidence_lines));
@@ -623,6 +675,18 @@ fn evaluate_bp6(input: &ClassificationInput, _config: &AcmgConfig) -> EvidenceCr
 ///    *outside* the standard splice region — donor-side `offset ≥ 7` or
 ///    acceptor-side `offset ≤ -21` — when SpliceAI shows no impact and the
 ///    position is not highly conserved.
+///
+/// Two departures from Walker 2023, found when the recommendation was read against
+/// this code in October 2026. The paper applies BP7 after BP4, which for SpliceAI is a
+/// score of 0.1 or below, and cautions against a conservation test unless its tool,
+/// depth and cut point have an empirical justification, having found that the extra
+/// filter improved no negative predictive value in its curated dataset. This code
+/// takes a score below `spliceai_pathogenic` (0.2) as "no impact" and keeps Richards
+/// 2015's "not highly conserved" as `phylop` below `phylop_conserved`, which is why
+/// removing PhyloP removes every BP7. Measured on the ClinVar 2-star+ benchmark
+/// (`manuscript/acmg`, Section 3.3): switching the conservation test off adds 16,482
+/// correct benign-side calls and 2 missed diagnoses, and asking for SpliceAI of at
+/// most 0.1 as well removes 402 calls and no error. Neither has been changed.
 ///
 /// The extension also carries a far boundary, which Walker 2023 does not state
 /// and which is set here by measurement rather than assertion: see
@@ -796,7 +860,7 @@ mod tests {
         ClinvarProteinData, ClinvarProteinVariant, GnomadGeneData, RevelData, SpliceAiData,
     };
     use crate::test_support::minimal_input;
-    use fastvep_core::Impact;
+    use fastvep_core::{HgvsPlacement, Impact};
 
     fn make_input(
         consequences: Vec<Consequence>,
@@ -1039,8 +1103,8 @@ mod tests {
     /// own position agrees with the consequence terms, which are decided there
     /// too.
     #[test]
-    fn test_bp7_reads_the_variants_own_offset_and_not_the_shifted_one() {
-        let mk = |own, shifted| {
+    fn test_bp7_reads_the_variants_own_offset_and_not_the_placed_one() {
+        let mk = |own, placed: i64| {
             let mut input = make_input(
                 vec![Consequence::IntronVariant],
                 None,
@@ -1049,16 +1113,118 @@ mod tests {
                 None,
             );
             input.intronic_offset = own;
-            input.shifted_intronic_offset = shifted;
+            input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: placed });
             evaluate_bp7(&input, &AcmgConfig::default())
         };
         // Deep where it sits, inside the splice region where HGVS numbers it.
-        assert!(mk(Some(-25), Some(-9)).met);
+        assert!(mk(Some(-25), -9).met);
         // Inside the splice region where it sits, deep where HGVS numbers it.
-        assert!(!mk(Some(1), Some(21)).met);
+        assert!(!mk(Some(1), 21).met);
         // With no position for the change there is nothing to extend BP7 on,
         // and the numbered one does not stand in for it.
-        assert!(!mk(None, Some(21)).met);
+        assert!(!mk(None, 21).met);
+    }
+
+    /// A change HGVS places wholly inside an intron past ±2 edits no exon base,
+    /// so the record's null term is not PVS1 territory and its splice path is as
+    /// open as any other intronic variant's. MSH6 `c.3801+3_3801+6dup` is
+    /// `frameshift_variant` only because its record anchors on the exon's last
+    /// base.
+    #[test]
+    fn test_bp4_splice_path_opens_for_a_null_term_placed_wholly_in_the_intron() {
+        let config = AcmgConfig::default();
+        let mut input = make_input(
+            vec![Consequence::FrameshiftVariant],
+            None,
+            Some(0.02),
+            None,
+            None,
+        );
+        // As the record reads: PVS1 territory, and BP4 stays out of it.
+        let anchored = evaluate_bp4(&input, &config);
+        assert!(!anchored.met);
+        assert!(anchored.details["splice_skipped_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("PVS1-territory")));
+
+        input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 8 });
+        let placed = evaluate_bp4(&input, &config);
+        assert!(placed.met, "{}", placed.summary);
+        assert_eq!(placed.strength, EvidenceStrength::Supporting);
+        assert_eq!(
+            placed.details["hgvs_placement"],
+            serde_json::json!({"kind": "intronic", "offset": 8})
+        );
+
+        // Placed at the dinucleotide itself, it is still PVS1 territory.
+        input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 2 });
+        assert!(!evaluate_bp4(&input, &config).met);
+        // And an inconclusive placement changes nothing.
+        input.hgvs_placement = Some(HgvsPlacement::Spans);
+        assert!(!evaluate_bp4(&input, &config).met);
+    }
+
+    /// The same for the protein-length terms BP4 refuses: an in-frame term
+    /// whose record anchors in an exon but whose edit lies in the intron.
+    #[test]
+    fn test_bp4_splice_path_opens_for_a_length_term_placed_wholly_in_the_intron() {
+        let config = AcmgConfig::default();
+        for term in [
+            Consequence::InframeInsertion,
+            Consequence::InframeDeletion,
+            Consequence::StopLost,
+            Consequence::ProteinAlteringVariant,
+        ] {
+            let mut input = make_input(vec![term], None, Some(0.0), None, None);
+            assert!(!evaluate_bp4(&input, &config).met, "{term:?} as anchored");
+            input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: -9 });
+            assert!(evaluate_bp4(&input, &config).met, "{term:?} placed");
+        }
+    }
+
+    #[test]
+    fn test_bp3_does_not_apply_to_an_in_frame_term_placed_wholly_in_the_intron() {
+        let config = AcmgConfig::default();
+        let mut input = make_input(vec![Consequence::InframeDeletion], None, None, None, None);
+        input.in_repeat_region = Some(true);
+        assert!(evaluate_bp3(&input, &config).met);
+
+        input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 8 });
+        let placed = evaluate_bp3(&input, &config);
+        assert!(!placed.met);
+        assert!(placed.evaluated);
+        // The record says in-frame and BP3 says it is not, so BP3 says why.
+        assert!(placed.summary.contains("intron"), "{}", placed.summary);
+        assert_eq!(placed.details["is_inframe_indel"], serde_json::json!(false));
+        assert_eq!(
+            placed.details["hgvs_placement"],
+            serde_json::json!({"kind": "intronic", "offset": 8})
+        );
+
+        // The same without a repeat database: the stand-down is an answer, not a
+        // missing input.
+        input.in_repeat_region = None;
+        let no_database = evaluate_bp3(&input, &config);
+        assert!(!no_database.met);
+        assert!(no_database.evaluated);
+        assert!(
+            no_database.summary.contains("intron"),
+            "{}",
+            no_database.summary
+        );
+        input.in_repeat_region = Some(true);
+
+        // A record whose terms never said in-frame has nothing to explain.
+        let mut other = make_input(vec![Consequence::MissenseVariant], None, None, None, None);
+        other.in_repeat_region = Some(true);
+        other.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 8 });
+        let other = evaluate_bp3(&other, &config);
+        assert_eq!(other.summary, "Not an in-frame insertion or deletion");
+        assert!(other.details.get("hgvs_placement").is_none());
+
+        // At the dinucleotide the change may still alter coding sequence.
+        input.hgvs_placement = Some(HgvsPlacement::Intronic { offset: 1 });
+        assert!(evaluate_bp3(&input, &config).met);
     }
 
     #[test]
@@ -1324,7 +1490,9 @@ mod tests {
             None,
             Some(bp1_gene_constraints()),
         );
-        input.clinvar_protein = Some(clinvar_protein_with_pathogenic_missense(12));
+        input.clinvar_protein = Some(std::sync::Arc::new(
+            clinvar_protein_with_pathogenic_missense(12),
+        ));
         let result = evaluate_bp1(&input, &AcmgConfig::default());
         assert!(!result.met);
         assert!(result.evaluated);
@@ -1344,11 +1512,11 @@ mod tests {
             None,
             Some(bp1_gene_constraints()),
         );
-        input.clinvar_protein = Some(ClinvarProteinData {
+        input.clinvar_protein = Some(std::sync::Arc::new(ClinvarProteinData {
             protein_variants: vec![],
             benign_indexed: true,
             ..Default::default()
-        });
+        }));
         let result = evaluate_bp1(&input, &AcmgConfig::default());
         assert!(result.met);
     }
@@ -1416,5 +1584,84 @@ mod tests {
         );
         let result = evaluate_bp1(&input, &AcmgConfig::default());
         assert!(!result.met);
+    }
+    // ── BP2: the trans arm needs a gene whose established diseases are dominant and none recessive ──
+
+    use crate::sa_extract::{CompanionVariant, OmimData};
+
+    fn bp2_input(phenotypes: &[&str], companions: Vec<CompanionVariant>) -> ClassificationInput {
+        let mut input = minimal_input();
+        input.omim = Some(OmimData {
+            mim_number: None,
+            phenotypes: Some(phenotypes.iter().map(|p| p.to_string()).collect()),
+        });
+        input.companion_variants = companions;
+        input
+    }
+
+    fn pathogenic_companion(in_trans: Option<bool>) -> CompanionVariant {
+        CompanionVariant {
+            is_clinvar_pathogenic: true,
+            is_clinvar_likely_pathogenic: false,
+            is_in_trans: in_trans,
+            proband_het: true,
+            hgvsc: None,
+        }
+    }
+
+    const AD: &str = "a dominant disease (ClinGen Definitive/AD, MONDO:0000001)";
+    const AR: &str = "a recessive disease (ClinGen Strong/AR, MONDO:0000002)";
+    const AR_LIMITED: &str = "a doubtful recessive disease (ClinGen Limited/AR, MONDO:0000003)";
+    const SD: &str = "a semidominant disease (ClinGen Moderate/SD, MONDO:0000004)";
+    const XL: &str = "an X-linked disease (ClinGen Definitive/XL, MONDO:0000005)";
+
+    #[test]
+    fn test_bp2_trans_arm_applies_to_a_gene_whose_diseases_are_dominant_only() {
+        let input = bp2_input(&[AD], vec![pathogenic_companion(Some(true))]);
+        let r = evaluate_bp2(&input, &AcmgConfig::default());
+        assert!(r.met, "{}", r.summary);
+        assert_eq!(r.details["is_dominant_gene"], true);
+        assert_eq!(r.details["is_recessive_gene"], false);
+    }
+
+    /// A gene with an autosomal dominant disease and an autosomal recessive one: a variant in trans with a
+    /// pathogenic one is what PM3 counts for the recessive disease, so BP2 must not count it against the variant.
+    #[test]
+    fn test_bp2_trans_arm_does_not_apply_when_the_gene_also_has_a_recessive_disease() {
+        for (name, phenotypes) in [("AD and AR", vec![AD, AR]), ("SD", vec![SD])] {
+            let input = bp2_input(&phenotypes, vec![pathogenic_companion(Some(true))]);
+            let r = evaluate_bp2(&input, &AcmgConfig::default());
+            assert!(!r.met, "{name}: {}", r.summary);
+            assert_eq!(r.details["is_recessive_gene"], true, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_bp2_trans_arm_needs_a_dominant_disease_at_all() {
+        for (name, phenotypes) in [("X-linked", vec![XL]), ("recessive", vec![AR])] {
+            let input = bp2_input(&phenotypes, vec![pathogenic_companion(Some(true))]);
+            assert!(!evaluate_bp2(&input, &AcmgConfig::default()).met, "{name}");
+        }
+        let mut unknown = minimal_input();
+        unknown.companion_variants = vec![pathogenic_companion(Some(true))];
+        assert!(!evaluate_bp2(&unknown, &AcmgConfig::default()).met);
+    }
+
+    /// Only the established diseases of a gene say how it is inherited: a recessive disease that ClinGen
+    /// rates Limited does not take the trans arm away from a gene that is otherwise dominant.
+    #[test]
+    fn test_bp2_trans_arm_ignores_a_recessive_disease_that_is_not_established() {
+        let input = bp2_input(&[AD, AR_LIMITED], vec![pathogenic_companion(Some(true))]);
+        assert!(evaluate_bp2(&input, &AcmgConfig::default()).met);
+    }
+
+    /// The cis arm is for any inheritance, so it applies to every gene, annotated or not.
+    #[test]
+    fn test_bp2_cis_arm_applies_whatever_the_inheritance() {
+        for phenotypes in [vec![AD, AR], vec![SD], vec![XL], vec![AR], vec![]] {
+            let input = bp2_input(&phenotypes, vec![pathogenic_companion(Some(false))]);
+            let r = evaluate_bp2(&input, &AcmgConfig::default());
+            assert!(r.met, "{phenotypes:?}: {}", r.summary);
+        }
     }
 }

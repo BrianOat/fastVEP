@@ -4,10 +4,13 @@
 //!
 //! `protein_start` comes from the genomic left edge, which for a shrinking
 //! change on a right-to-left transcript is the end of the affected range. #93
-//! made `hgvsp_inframe_indel` try the other end when the peptide does not
-//! corroborate the first, which fixed the cases where the first end is not a
-//! match at all. It left the case where *both* ends match: `find()` takes the
-//! first, and on the reverse strand the first is the wrong one.
+//! made the notation try the other end when the peptide does not corroborate
+//! the first, which fixed the cases where the first end is not a match at all.
+//! It left the case where *both* ends match: `find()` took the first, and on
+//! the reverse strand the first is the wrong one. (The notation is built from
+//! Ensembl's own protein positions now, `Transcript::location`, and there is no
+//! anchor to guess; the test stays because the property it pins is the
+//! output's.)
 //!
 //! The gene below is built so that both ends match. The peptide is `MEGEGEA`
 //! and the deletion removes `EGE` at residues 2-4 - a reference that also sits
@@ -20,7 +23,7 @@
 //! a unit test that passes `protein_start` by hand would be asserting my own
 //! reading of the convention rather than the pipeline's.
 
-use fastvep_cli::pipeline::{run_annotate, AnnotateConfig};
+use fastvep_cli::pipeline::{run_annotate, AnnotateConfig, PickFlags};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -82,7 +85,7 @@ fn annotate(dir: &Path, strand: char) -> String {
         gff3: vec![gff3_path.to_string_lossy().into()],
         fasta: Some(fasta.to_string_lossy().into()),
         output_format: "vcf".into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: true,
         distance: 5000,
         cache_dir: None,
@@ -100,6 +103,9 @@ fn annotate(dir: &Path, strand: char) -> String {
         explicit_alleles: false,
         qc_rules: None,
         show_progress: false,
+        compat: Default::default(),
+        columns: Default::default(),
+        exclude: Default::default(),
         somatic: false,
     })
     .expect("annotation should succeed");

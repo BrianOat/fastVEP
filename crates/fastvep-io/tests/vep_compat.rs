@@ -3,7 +3,9 @@
 /// These tests verify that fastVEP's VCF parsing, allele normalization,
 /// and variant representation matches the behavior documented in
 /// ensembl-vep's Parser_VCF.t test suite.
-use fastvep_core::{Allele, Impact, Strand, VariantType};
+use fastvep_core::{
+    Allele, Impact, Ordinals, Strand, TranscriptLocation, TranscriptSpan, VariantType,
+};
 use fastvep_io::output;
 use fastvep_io::variant::{AlleleAnnotation, TranscriptVariation, VariationFeature};
 use fastvep_io::vcf::{parse_vcf_line, VcfParser};
@@ -490,15 +492,22 @@ fn mock_vf_missense() -> VariationFeature {
                 allele: Allele::from_str("C"),
                 consequences: vec![Consequence::MissenseVariant],
                 impact: Impact::Moderate,
-                cdna_position: Some((64, 64)),
-                cds_position: Some((4, 4)),
+                location: TranscriptLocation {
+                    cdna: TranscriptSpan::new(Some(64), Some(64)),
+                    cds: TranscriptSpan::new(Some(4), Some(4)),
+                    protein: TranscriptSpan::new(Some(2), Some(2)),
+                    exon: Some(Ordinals {
+                        first: 2,
+                        last: 2,
+                        total: 3,
+                    }),
+                    ..Default::default()
+                },
                 protein_position: Some((2, 2)),
                 amino_acids: Some(("K".into(), "Q".into())),
                 codons: Some(("Aag".into(), "Cag".into())),
                 exon: Some((2, 3)),
-                intron: None,
-                intron_offset: None,
-                shifted_intron_offset: None,
+                splice: Default::default(),
                 distance: None,
                 protein_length: None,
                 escapes_nmd: None,
@@ -512,6 +521,7 @@ fn mock_vf_missense() -> VariationFeature {
                 supplementary: Vec::new(),
                 acmg_classification: None,
                 oncogenicity_classification: None,
+                pick: false,
             }],
             canonical: false,
             strand: Strand::Forward,
@@ -527,7 +537,7 @@ fn mock_vf_missense() -> VariationFeature {
             hgnc_id: Some("HGNC:14825".into()),
             flags: vec![],
         }],
-        existing_variants: vec![],
+        known: Vec::new(),
         minimised: false,
         most_severe_consequence: Some(Consequence::MissenseVariant),
         variant_type: VariantType::Snv,
@@ -598,15 +608,22 @@ fn test_csq_frameshift_codon_format() {
                 allele: Allele::Deletion,
                 consequences: vec![Consequence::FrameshiftVariant],
                 impact: Impact::High,
-                cdna_position: Some((480, 480)),
-                cds_position: Some((5, 5)),
+                location: TranscriptLocation {
+                    cdna: TranscriptSpan::new(Some(480), Some(480)),
+                    cds: TranscriptSpan::new(Some(5), Some(5)),
+                    protein: TranscriptSpan::new(Some(2), Some(2)),
+                    exon: Some(Ordinals {
+                        first: 3,
+                        last: 3,
+                        total: 28,
+                    }),
+                    ..Default::default()
+                },
                 protein_position: Some((2, 2)),
                 amino_acids: Some(("E".into(), "X".into())),
                 codons: Some(("gAg".into(), "gg".into())),
                 exon: Some((3, 28)),
-                intron: None,
-                intron_offset: None,
-                shifted_intron_offset: None,
+                splice: Default::default(),
                 distance: None,
                 protein_length: None,
                 escapes_nmd: None,
@@ -620,6 +637,7 @@ fn test_csq_frameshift_codon_format() {
                 supplementary: Vec::new(),
                 acmg_classification: None,
                 oncogenicity_classification: None,
+                pick: false,
             }],
             canonical: false,
             strand: Strand::Forward,
@@ -635,7 +653,7 @@ fn test_csq_frameshift_codon_format() {
             hgnc_id: Some("HGNC:1939".into()),
             flags: vec![],
         }],
-        existing_variants: vec![],
+        known: Vec::new(),
         minimised: false,
         most_severe_consequence: Some(Consequence::FrameshiftVariant),
         variant_type: VariantType::Unknown,
@@ -707,17 +725,17 @@ fn test_csq_field_count_matches_vep() {
     // Extended field set includes all VEP fields plus CANONICAL, CCDS, ENSP, SOURCE, HGVS_OFFSET
     assert_eq!(
         output::DEFAULT_CSQ_FIELDS.len(),
-        51,
-        "DEFAULT_CSQ_FIELDS should have 51 fields"
+        49,
+        "DEFAULT_CSQ_FIELDS should have 49 fields"
     );
 
-    // Verify formatting produces 51 pipe-delimited values
+    // Verify formatting produces 49 pipe-delimited values
     let vf = mock_vf_missense();
     let csq = output::format_csq(&vf, output::DEFAULT_CSQ_FIELDS);
     let field_count = csq.split('|').count();
     assert_eq!(
-        field_count, 51,
-        "CSQ output should have 51 pipe-delimited fields"
+        field_count, 49,
+        "CSQ output should have 49 pipe-delimited fields"
     );
 }
 
@@ -731,7 +749,7 @@ fn test_csq_missense_full_42_field_match() {
     let csq = output::format_csq(&vf, output::DEFAULT_CSQ_FIELDS);
     let fields: Vec<&str> = csq.split('|').collect();
 
-    // VEP expected values (all 51 fields)
+    // VEP expected values (all 49 fields)
     let expected: Vec<&str> = vec![
         "C",                              // 0:  Allele
         "missense_variant",               // 1:  Consequence
@@ -782,8 +800,6 @@ fn test_csq_missense_full_42_field_match() {
         "",                               // 46: TRANSCRIPTION_FACTORS
         "",                               // 47: ACMG (empty when --acmg not run)
         "",                               // 48: ACMG_CRITERIA
-        "",                               // 49: ONCOGENICITY (empty when --somatic not run)
-        "",                               // 50: ONCOGENICITY_CRITERIA
     ];
 
     assert_eq!(
@@ -828,15 +844,22 @@ fn test_csq_frameshift_full_42_field_match() {
                 allele: Allele::Deletion,
                 consequences: vec![Consequence::FrameshiftVariant],
                 impact: Impact::High,
-                cdna_position: Some((258, 258)),
-                cds_position: Some((5, 5)),
+                location: TranscriptLocation {
+                    cdna: TranscriptSpan::new(Some(258), Some(258)),
+                    cds: TranscriptSpan::new(Some(5), Some(5)),
+                    protein: TranscriptSpan::new(Some(2), Some(2)),
+                    exon: Some(Ordinals {
+                        first: 3,
+                        last: 3,
+                        total: 5,
+                    }),
+                    ..Default::default()
+                },
                 protein_position: Some((2, 2)),
                 amino_acids: Some(("E".into(), "X".into())),
                 codons: Some(("gAg".into(), "gg".into())),
                 exon: Some((3, 5)),
-                intron: None,
-                intron_offset: None,
-                shifted_intron_offset: None,
+                splice: Default::default(),
                 distance: None,
                 protein_length: None,
                 escapes_nmd: None,
@@ -850,6 +873,7 @@ fn test_csq_frameshift_full_42_field_match() {
                 supplementary: Vec::new(),
                 acmg_classification: None,
                 oncogenicity_classification: None,
+                pick: false,
             }],
             canonical: false,
             strand: Strand::Forward,
@@ -865,7 +889,7 @@ fn test_csq_frameshift_full_42_field_match() {
             hgnc_id: Some("HGNC:1939".into()),
             flags: vec!["cds_end_NF".into()],
         }],
-        existing_variants: vec![],
+        known: Vec::new(),
         minimised: false,
         most_severe_consequence: Some(Consequence::FrameshiftVariant),
         variant_type: VariantType::Unknown,
@@ -931,8 +955,6 @@ fn test_csq_frameshift_full_42_field_match() {
         "",                   // 46: TRANSCRIPTION_FACTORS
         "",                   // 47: ACMG
         "",                   // 48: ACMG_CRITERIA
-        "",                   // 49: ONCOGENICITY
-        "",                   // 50: ONCOGENICITY_CRITERIA
     ];
 
     assert_eq!(
@@ -978,15 +1000,12 @@ fn test_csq_downstream_variant_match() {
                 allele: Allele::from_str("C"),
                 consequences: vec![Consequence::DownstreamGeneVariant],
                 impact: Impact::Modifier,
-                cdna_position: None,
-                cds_position: None,
+                location: TranscriptLocation::default(),
                 protein_position: None,
                 amino_acids: None,
                 codons: None,
                 exon: None,
-                intron: None,
-                intron_offset: None,
-                shifted_intron_offset: None,
+                splice: Default::default(),
                 distance: Some(1681),
                 protein_length: None,
                 escapes_nmd: None,
@@ -1000,6 +1019,7 @@ fn test_csq_downstream_variant_match() {
                 supplementary: Vec::new(),
                 acmg_classification: None,
                 oncogenicity_classification: None,
+                pick: false,
             }],
             canonical: false,
             strand: Strand::Forward,
@@ -1015,7 +1035,7 @@ fn test_csq_downstream_variant_match() {
             hgnc_id: Some("HGNC:31276".into()),
             flags: vec![],
         }],
-        existing_variants: vec![],
+        known: Vec::new(),
         minimised: false,
         most_severe_consequence: Some(Consequence::DownstreamGeneVariant),
         variant_type: VariantType::Unknown,
@@ -1031,7 +1051,7 @@ fn test_csq_downstream_variant_match() {
     // VEP expected:
     // C|downstream_gene_variant|MODIFIER|OR4G11P|ENSG00000240361|Transcript|ENST00000492842.2|
     // transcribed_unprocessed_pseudogene|||||||||||A|A/C|1681|1|||HGNC|HGNC:31276|...
-    assert_eq!(fields.len(), 51);
+    assert_eq!(fields.len(), 49);
     assert_eq!(fields[0], "C");
     assert_eq!(fields[1], "downstream_gene_variant");
     assert_eq!(fields[2], "MODIFIER");
@@ -1073,15 +1093,19 @@ fn test_csq_intron_variant_match() {
                 allele: Allele::from_str("T"),
                 consequences: vec![Consequence::IntronVariant],
                 impact: Impact::Modifier,
-                cdna_position: None,
-                cds_position: None,
+                location: TranscriptLocation {
+                    intron: Some(Ordinals {
+                        first: 1,
+                        last: 1,
+                        total: 5,
+                    }),
+                    ..Default::default()
+                },
                 protein_position: None,
                 amino_acids: None,
                 codons: None,
                 exon: None,
-                intron: Some((1, 5)),
-                intron_offset: None,
-                shifted_intron_offset: None,
+                splice: Default::default(),
                 distance: None,
                 protein_length: None,
                 escapes_nmd: None,
@@ -1095,6 +1119,7 @@ fn test_csq_intron_variant_match() {
                 supplementary: Vec::new(),
                 acmg_classification: None,
                 oncogenicity_classification: None,
+                pick: false,
             }],
             canonical: false,
             strand: Strand::Forward,
@@ -1110,7 +1135,7 @@ fn test_csq_intron_variant_match() {
             hgnc_id: Some("HGNC:122".into()),
             flags: vec![],
         }],
-        existing_variants: vec![],
+        known: Vec::new(),
         minimised: false,
         most_severe_consequence: Some(Consequence::IntronVariant),
         variant_type: VariantType::Unknown,
@@ -1126,7 +1151,7 @@ fn test_csq_intron_variant_match() {
     // VEP expected:
     // T|intron_variant|MODIFIER|ACP1|ENSG00000143727|Transcript|ENST00000272065.10|
     // protein_coding||1/5|||||||||C|C/T||1|||HGNC|HGNC:122|MANE_Select|NM_004300.4||1|P3|...
-    assert_eq!(fields.len(), 51);
+    assert_eq!(fields.len(), 49);
     assert_eq!(fields[0], "T");
     assert_eq!(fields[1], "intron_variant");
     assert_eq!(fields[2], "MODIFIER");

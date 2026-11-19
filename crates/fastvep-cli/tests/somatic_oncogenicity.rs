@@ -13,7 +13,7 @@
 //! must not change when it is turned on.
 
 use fastvep_cli::pipeline::sa_build::run_sa_build;
-use fastvep_cli::pipeline::{run_annotate, AnnotateConfig};
+use fastvep_cli::pipeline::{run_annotate, AnnotateConfig, PickFlags};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -47,8 +47,11 @@ fn config(dir: &Path, output: &Path, format: &str, fasta: bool, somatic: bool) -
         gff3: vec![dir.join("test.gff3").to_string_lossy().into()],
         fasta: fasta.then(|| dir.join("test.fa").to_string_lossy().into()),
         output_format: format.into(),
-        pick: false,
+        pick: PickFlags::default(),
         hgvs: false,
+        columns: Default::default(),
+        compat: Default::default(),
+        exclude: Default::default(),
         distance: 0,
         cache_dir: None,
         transcript_cache: None,
@@ -259,26 +262,30 @@ fn somatic_leaves_acmg_json_output_unchanged() {
 fn somatic_leaves_acmg_vcf_output_unchanged() {
     let without = annotate_acmg("vcf", false);
     let with = annotate_acmg("vcf", true);
+    const OWN: [&str; 2] = ["ONCOGENICITY", "ONCOGENICITY_CRITERIA"];
 
-    let header = without
-        .lines()
-        .find(|l| l.starts_with("##INFO=<ID=CSQ"))
-        .unwrap();
-    let names: Vec<&str> = header
-        .split("Format: ")
-        .nth(1)
-        .unwrap()
-        .trim_end_matches("\">")
-        .split('|')
-        .collect();
-    let own: Vec<usize> = ["ONCOGENICITY", "ONCOGENICITY_CRITERIA"]
-        .iter()
-        .map(|n| names.iter().position(|x| x == n).unwrap())
-        .collect();
-    let acmg = names.iter().position(|x| *x == "ACMG").unwrap();
+    let names = |vcf: &str| -> Vec<String> {
+        vcf.lines()
+            .find(|l| l.starts_with("##INFO=<ID=CSQ"))
+            .unwrap()
+            .split("Format: ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches("\">")
+            .split('|')
+            .map(str::to_string)
+            .collect()
+    };
+    // The columns are --somatic's own: absent without it, and appended after
+    // every column a run without it writes, so none of those moves.
+    let (names_without, names_with) = (names(&without), names(&with));
+    assert!(!names_without.iter().any(|n| OWN.contains(&n.as_str())));
+    assert_eq!(names_with[..names_without.len()], names_without[..]);
+    assert_eq!(names_with[names_without.len()..], OWN);
+    let acmg = names_without.iter().position(|x| x == "ACMG").unwrap();
 
     // Every CSQ column but the two --somatic owns, per variant line.
-    let rows = |vcf: &str| -> Vec<Vec<Vec<String>>> {
+    let rows = |vcf: &str, keep: usize| -> Vec<Vec<Vec<String>>> {
         vcf.lines()
             .filter(|l| !l.starts_with('#'))
             .map(|l| {
@@ -288,19 +295,15 @@ fn somatic_leaves_acmg_vcf_output_unchanged() {
                     .find_map(|kv| kv.strip_prefix("CSQ="))
                     .unwrap();
                 csq.split(',')
-                    .map(|entry| {
-                        entry
-                            .split('|')
-                            .enumerate()
-                            .filter(|(i, _)| !own.contains(i))
-                            .map(|(_, f)| f.to_string())
-                            .collect()
-                    })
+                    .map(|entry| entry.split('|').take(keep).map(str::to_string).collect())
                     .collect()
             })
             .collect()
     };
-    let (a, b) = (rows(&without), rows(&with));
+    let (a, b) = (
+        rows(&without, names_without.len()),
+        rows(&with, names_without.len()),
+    );
     assert!(
         a.iter().flatten().any(|entry| !entry[acmg].is_empty()),
         "fixture produced no ACMG classification"
