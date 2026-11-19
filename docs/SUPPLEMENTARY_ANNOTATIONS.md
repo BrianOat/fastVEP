@@ -146,9 +146,11 @@ readers and compared:
 |--------|---------|----------------------|--------------|-------|
 | ClinVar (full release) | 4,438,232 | 50.5 MB | 40.9 MB | 0.81× |
 | SpliceAI (chr22) | 827,827 | 4.8 MB | 2.7 MB | 0.56× |
-| REVEL (chr22) | 1,776,286 | 8.7 MB | 3.8 MB | 0.44× |
+| REVEL (chr22) | 1,776,286 | 9.1 MB | 4.0 MB | 0.44× |
 | gnomAD (chr22) | 852,255 | 15.4 MB | 12.9 MB | 0.84× |
 | PhyloP (chr22) | 852,255 | 3.1 MB | 1.4 MB | 0.45× |
+
+The ClinVar and REVEL rows were measured again on 2026-11-07 with 0.5.0 (`benchmarks/run_sa_formats.py`), in megabytes of 10^6 bytes; the SpliceAI, gnomAD and PhyloP rows come from an earlier measurement, whose sources are not among the files that the repository's scripts fetch, and their unit was not recorded (the REVEL chr22 files of this run measure 8.7 and 3.8 in mebibytes, the numbers that row had, so the older rows are probably mebibytes).
 
 Annotating 308,740 real chr22 variants against all five of those databases at
 once takes **12.7 s from the `.osa` set and 8.5 s from the `.osa2` set (1.50×)**,
@@ -212,27 +214,79 @@ column-oriented sources it is not, so if you still have the upstream release
 prefer `sa-build --format osa2` to get the column layout. Which of the two ends
 up smaller is data-dependent, so compare if size matters.
 
+### Databases that hold nothing
+
+A database with no record opens without an error and answers every query with "no record", which for a frequency source reads as "absent from the population".
+The dbSNP database that was meant to serve GRCh37 on fastvep.org was ten bytes of header: it had been built from a release whose contigs are RefSeq accessions, none matched the assembly, and the builder wrote it and exited with success.
+So the built-in sources refuse to write one.
+`sa-build` (and `sa-convert`, which would carry an empty `.osa` over) stops with an error that names the usual causes, removes what it had begun to write, and exits non-zero; `--allow-empty` writes the database anyway, for the case where nothing is the right answer, such as the shard of a chromosome that has no record in the regions being built.
+`custom_vcf` in its default format (`.osa2`) refuses like the others; the older behaviour of a warning and an empty file remains for `custom_bed` and for `custom_vcf` under `--format osa`, so that a user can iterate on a filter.
+
+A loader refuses to serve one that already exists, whoever built it.
+`fastvep annotate` prints `warning: <file> was not loaded: it holds no records ...` on stderr for each database file that is empty or cannot be opened (a truncated copy is the common one), because `tracing` has no subscriber in the command line and the file would otherwise be a source that is silently missing from every row.
+`fastvep-web` logs the same and reports it in the ACMG verdict, where the source counts as missing.
+
 #### Chunk width for dense sources (`--chunk-bits`)
 
 A chunk is the unit a query loads, and it covers a fixed genomic width -- 2^20
 bases, 1 Mb, by default.
 A blob-encoded chunk stores its records' JSON one after another in a single
-compressed stream, so reading one record decompresses the whole chunk's worth.
+compressed stream, so reading one record decompresses the whole chunk's worth,
+and a column-encoded one inflates and indexes every record of the chunk to
+answer for one.
+The width is therefore the price of a lookup that misses the cache, and how
+many records a megabase holds decides whether that price is small.
 
-That is cheap for the sparse sources.
-dbSNP, ClinVar, COSMIC and REVEL put kilobytes in a megabase, and the wide chunk
+It is small for the sparse sources.
+ClinVar and COSMIC put a few thousand records in a megabase, and the wide chunk
 is what keeps them compact.
-It is not cheap for a source that scores nearly every base.
-SpliceAI carries three alternates at essentially every position of a gene body,
-which is hundreds of megabytes of JSON in a single 1 Mb chunk: queries slow to a
-crawl, and past 256 MiB the chunk exceeds the blob decompression limit outright,
-at which point *every* lookup in that megabase fails.
+It is not small for a source with hundreds of thousands, and a source does not
+have to score every base to be one.
+dbSNP is dense, 9.4 GB for the 3,100 megabases of GRCh38, which is about 3 MB of
+compressed records in each megabase: on the hosted site, 1,000 scattered GRCh38
+variants took 24 s with it loaded and 0.5 s without it (23 ms a lookup, and the
+same on a second pass, because the shared chunk cache is 24 MiB for each core
+and holds a few dozen chunks of that size of the 3,100).
+SpliceAI is the extreme: three alternates at essentially every position of a
+gene body, which is hundreds of megabytes of JSON in a single 1 Mb chunk, so
+that queries slow to a crawl and, past 256 MiB, the chunk exceeds the blob
+decompression limit outright and *every* lookup in that megabase fails.
 
-Pass `--chunk-bits 16` (65 kb) when converting such a source:
+Pass `--chunk-bits 16` (65 kb) for such a source, to `sa-build` or, for a
+database that is already built as a v1 `.osa`, to `sa-convert`:
 
 ```bash
+fastvep sa-build --source dbsnp -i GCF_000001405.40.gz -o dbsnp --assembly GRCh38 --chunk-bits 16
 fastvep sa-convert -i old/spliceai.osa -o new/spliceai --chunk-bits 16
 ```
+
+`sa-build` applies it to every `.osa2` it writes and says so, with a warning,
+when the build writes something that has no chunks (a v1 file, an interval or a
+gene database); without the option each source keeps its own width.
+`scripts/build-sa-databases.sh --chunk-bits 16` passes it to the allele-level
+sources.
+
+Measured on gnomAD v4.1 exomes, chromosome 21 (2,188,842 records), 3,041
+variants in random order under a cache too small to hold one chunk, so that
+every lookup loads its chunk:
+
+| `--chunk-bits` | file size | build | 3,041 lookups | CPU of the lookups |
+|---|---:|---:|---:|---:|
+| 20 (default) | 20.7 MB | 153 s | 13.2 s | 42 s |
+| 16 | 22.7 MB (+9.7%) | 156 s | 4.2 s | 7.3 s |
+| no database | | | 1.9 s | |
+
+The two databases return the same annotation for every variant (the sorted
+outputs have the same checksum).
+With the variants in position order, and so one chunk loaded for many, the two
+took the same time as no database at all: the width matters when the variants
+are scattered over many chunks, which is what a genome-wide VCF is.
+
+Measured on dbSNP build 157 for GRCh38 (1,391,478,698 records) on the hosted site, 4 vCPUs:
+the file at 16 bits is 9.19 GB, and 4,000 scattered variants went through a whole `annotate` run, process start included, in 18 s,
+against 106 s through the file of 1 Mb chunks that the builder of July had written from the release that was then the latest (9.40 GB), which is 5.9 times faster.
+The two files return the same RS number for 3,883 of the 3,884 variants that have a record.
+The other variant has two current RS numbers in dbSNP for one allele; the older file returned one of them arbitrarily, and the writer now keeps the first record of the source for any run of equal keys, at every width.
 
 Measured on a source built to SpliceAI's density, 300 scattered queries:
 
@@ -249,7 +303,7 @@ so a converted database at `--chunk-bits 16` is close to it.
 Do not lower it for the sparse sources: narrower chunks mean more of them, and
 real ClinVar grows from 40.9 MB to 53.6 MB (and from 7,566 to 54,911 archive
 entries) between 20 and 16.
-`chunk_bits` is recorded per file, so a database converted at any width is read
+`chunk_bits` is recorded per file, so a database built at any width is read
 correctly without telling the reader anything.
 
 A run that hits the limit now says so, once per source, rather than returning
@@ -344,7 +398,7 @@ VCF 4.3 (data lines, fixed fields) restricts only `;`, `=` and `,` inside an INF
 
 The one character that used to be encoded here and is not any more is the colon.
 It is reserved by nothing, Ensembl VEP writes it through literally, and fastVEP's own `CSQ` column already did too - every `HGVSc` carries one - so encoding it here contradicted the same record's `CSQ` field.
-`validation/run_escaping_probe.sh` measures what VEP does with each of these characters against a real VEP 115.1, so the rules above can be rechecked rather than taken on trust.
+`validation/run_escaping_probe.sh` measures what VEP does with each of these characters against a real VEP 116.3, so the rules above can be rechecked rather than taken on trust.
 
 Space and `"` are encoded although the spec permits both, and for the same reason in each case: there is no `FV_*` field in VEP to be diffed against, so matching VEP buys nothing here, while a reader of the column loses something real.
 `awk` and `cut -d' '` split a record on the space; `R`'s `read.delim` and Python's `csv` both treat `"` as opening a quoted field and swallow the rest of the line.

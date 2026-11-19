@@ -13,7 +13,9 @@ The benchmark compares fastVEP with ClinVar's own 2-star-and-better classificati
 That is a reference, not ground truth: ClinVar's classifications can rest on the same kinds of evidence fastVEP computes (frequency, computational prediction, consequence), so agreement is partly circular, and a disagreement can as well be ClinVar being out of date or fastVEP being wrong.
 Older text in this document, and the `truth` column in older result files, mean ClinVar's classification and nothing stronger; the scripts accept both the old and the new file and column names.
 
-This document reflects the state after the SVI alignment series (PR1–PR10).
+This document reflects the state after the SVI alignment series (PR1–PR10), and its benchmark sections describe the benchmark as it stood at v7.
+The classifier of this release is v38: [`RUN_VERSIONS.md`](RUN_VERSIONS.md) records every run since, and [`manuscript/acmg/manuscript.md`](../../manuscript/acmg/manuscript.md) is the current account of the method and of what it was measured to do.
+A number below that names a run is that run's, and the thresholds are those of [`docs/ACMG.md`](../../docs/ACMG.md).
 Each criterion section includes the ClinGen reference and any deviations
 from a strict reading of the SVI text. A per-criterion "Limitations"
 column flags criteria that fall back to legacy or conservative behavior
@@ -38,7 +40,7 @@ that drove each call in `details.pp3_source` / `details.ps1_path` /
 | PS3 | Strong | Functional studies | Not automatable — NotEvaluated |
 | PS4 | Strong | Prevalence in affected vs controls | **NotEvaluated by default** — requires case-control statistics. Optional legacy proxy via `use_clinvar_stars_as_ps4_proxy` |
 | PM1 | Moderate | Mutational hotspot / functional domain | ClinVar protein-position density. Capped against PP3 per Pejaver 2022 |
-| PM2 | Supporting* | Absent / extremely rare in population | gnomAD raw AF, **inheritance-aware** (not recessive-only: AF ≤ 0.00004; recessive-only: AF ≤ 0.00007, which equals the Hearing Loss VCEP's recessive bar; SVI PM2 v1.0 gives no frequency) |
+| PM2 | Supporting* | Absent / extremely rare in population | gnomAD raw AF, **inheritance-aware** (not recessive-only: AF ≤ 0.00004; recessive-only: AF ≤ 0.00007, which equals the Hearing Loss VCEP's recessive threshold; SVI PM2 v1.0 gives no frequency) |
 | PM3 | Supporting/Moderate/Strong/VeryStrong | In trans with pathogenic (recessive) | **SVI PM3 v1.0 points-based**: P / LP companion × phasing × hom-occurrence → 0.5 / 1.0 / 2.0 / 4.0 thresholds |
 | PM4 | Moderate | Protein length change | Consequence (in-frame indel, stop-loss) |
 | PM5 | Moderate | Novel missense at known pathogenic position | ClinVar protein-position index (different alt AA) |
@@ -55,8 +57,8 @@ that drove each call in `details.pp3_source` / `details.ps1_path` /
 | Criterion | Strength | Description | Data Source / Notes |
 |-----------|----------|-------------|---------------------|
 | BA1 | Standalone | Common variant (AF > 5%) | gnomAD max population AF, with **AN ≥ 2000** at the site (the dataset-size condition of the BA1 recommendation, Ghosh 2018, applied to the site's AN; the March 2024 gnomAD v4 communication states no floor). Honors the **curated frequency-exception list** - Ghosh 2018's nine, three hypomorphic alleles that also block BS1 and BS2, and three more the round-6 review named (G6PD x2, SERPINC1) that do the same |
-| BS1 | Strong | Greater than expected frequency | gnomAD **max-population AF** (mirrors BA1; was cohort `all_af` pre-v7); gene-specific or default 0.01; same AN minimum as BA1 |
-| BS2 | Strong | Observed in healthy adults | gnomAD counts + ClinGen GDV inheritance (or OMIM legacy). Both branches hold a 95 % lower bound on the frequency of the individuals the disorder would affect against a prevalence bar. Dominant genes: carriers (`AC - nhomalt`) with AC ≥ 5 (`bs2_ad_min_ac`) and a bound above `bs2_ad_prevalence_threshold` (3e-4). Recessive and X-linked genes: individuals with no functional copy, with a bound above `bs2_hom_prevalence_threshold` (1e-3). Not evaluated without an AN, or with an AN of 0. |
+| BS1 | Strong | Greater than expected frequency | gnomAD **max-population AF** (mirrors BA1; was cohort `all_af` pre-v7); gene-specific or default 0.005 (a filtering allele frequency of 0.5%, from v12); same AN minimum as BA1 |
+| BS2 | Strong | Observed in healthy adults | gnomAD counts + ClinGen GDV inheritance (or OMIM legacy). Both branches hold a 95 % lower bound on the frequency of the individuals the disorder would affect against a prevalence threshold. Dominant genes: carriers (`AC - nhomalt`) with AC ≥ 5 (`bs2_ad_min_ac`) and a bound above `bs2_ad_prevalence_threshold` (3e-4). Recessive and X-linked genes: individuals with no functional copy, with a bound above `bs2_hom_prevalence_threshold` (1e-3). Not evaluated without an AN, or with an AN of 0. |
 | BS3 | Strong | Functional studies — no damage | Not automatable — NotEvaluated |
 | BS4 | Strong | Lack of segregation | Not automatable — NotEvaluated |
 | BP1 | Supporting | Missense in truncation-disease gene | gnomAD pLI ≥ 0.9 + misZ < 2.0 |
@@ -117,11 +119,11 @@ When NMD prediction or other transcript-level signals are missing,
 PVS1 falls back to legacy full-strength VeryStrong for backward
 compatibility.
 
-### PM2 Inheritance-Aware Bars (not from SVI PM2 v1.0, which sets only the strength)
+### PM2 Inheritance-Aware Thresholds (not from SVI PM2 v1.0, which sets only the strength)
 
-| Inheritance | Bar |
+| Inheritance | Threshold |
 |-------------|-----|
-| Not recessive-only (AD, both, unknown) | AF ≤ 0.00004 (set at v10 by a sweep under the 2015 table; nearly flat under the point system) |
+| Not recessive-only (AD, both, unknown) | AF ≤ 0.00004 (set at v10 by a sweep under the 2015 table; nearly flat under the default scheme) |
 | Recessive-only | AF ≤ 0.00007 (0.007%; swept for the ACMG manuscript: flat) |
 | Per-gene override | Wins over inheritance default |
 
@@ -209,6 +211,10 @@ no opposite-direction call on the ClinVar 2-star+ benchmark.
 
 ### Combination Rules (19 = 18 Richards 2015 + 1 SVI Sept 2020)
 
+The list below is the 2015 table with the SVI rule of September 2020.
+By default it decides the benign direction only: the pathogenic direction is scored on the point scale of Tavtigian et al. (2020), where 6 to 9 points is Likely Pathogenic and 10 or more is Pathogenic.
+The pathogenic rules below apply with `use_point_system = false`, which puts the 2015 table on both directions (`docs/ACMG.md`, "Which combining rules apply" and "Classification Combination Rules").
+
 **Benign:**
 1. BA1 standalone → Benign
 2. ≥2 BS → Benign
@@ -240,6 +246,7 @@ no opposite-direction call on the ClinVar 2-star+ benchmark.
 **independently**. The result is VUS-Conflicting only when **both**
 directions reach a definite call (P/LP and B/LB). Otherwise the
 directional call wins.
+The classifier has since added two guards and a veto to this rule: a call is withheld when the other direction holds Strong evidence without reaching a call, and a Likely Pathogenic call is held at VUS at a site that gnomAD rejected where the withheld frequency would have met BA1 or BS1 (`docs/ACMG.md`, "Conflicting Evidence").
 
 ### Trio Analysis
 
@@ -270,11 +277,11 @@ Concrete pipeline (`analysis/acmg_benchmark/scripts/run_benchmark.sh`):
    `gene`, `clnsig`, `normalized_class`, `review_stars`, `rcv`).
 2. **Annotation**: GFF3 + FASTA cache + supplementary annotation
    directory (`--sa-dir`) loaded once; all 673,660 variants annotated
-   with `--acmg --pick` to a single JSON file.
+   with `--acmg --pick` to a bgzipped VCF.
 3. **Concordance** (`analysis/acmg_benchmark/scripts/03_evaluate_concordance.py`):
-   stream-parses the JSON via `ijson` (memory-bounded — output is ~24 GB
-   pretty-printed), keys each variant on `(chrom, pos, ref, alt)`,
-   reads the picked transcript's `acmg.classification`, and fills a
+   reads the VCF, keys each variant on `(chrom, pos, ref, alt)`,
+   takes the first CSQ entry whose `ACMG` field is not empty (with `--pick`, usually the
+   canonical transcript), and fills a
    5×6 ClinVar-classification × predicted matrix (extra column for NoCall).
 
 Outputs: `concordance_summary.txt` (free-text rollup),
@@ -287,13 +294,13 @@ opposite-direction calls).
 
 | Source | Build | Records |
 |--------|-------|---------|
-| ClinVar (.osa) | `fastvep sa-build --source clinvar` from `clinvar.vcf.gz` | 4,402,501 |
+| ClinVar (.osa) | `fastvep sa-build --source clinvar` from `clinvar.vcf.gz` | 4,438,232 (the release of 27 June 2026, as built for v37 and v38; v7 read 4,402,501) |
 | ClinVar gene index (.oga) | `--source clinvar_protein` from `variant_summary.txt.gz` | 15,665 genes (protein + canonical-splice indices) |
-| gnomAD v4.1 exomes (.osa, per-chrom) | tabix-extracted to ClinVar 2-star+ regions (24,350 merged ranges, `bedtools merge -d 5000`), `--source gnomad` per chrom (chr1..22, X, Y, MT) | 25 × .osa |
+| gnomAD v4.1 exomes (.osa2, per-chrom) | the benchmark reads databases built from the whole of the file (`sa_db_complete/`, with the SpliceAI and PhyloP databases below: 72 files whose checksums and build are in `results/complete_databases/`), `--source gnomad --chunk-bits 16` per chrom (chr1..22, X, Y; there is no mitochondrial file); the regional files of `sa_db/` (tabix-extracted to ClinVar 2-star+ regions, 24,350 merged ranges, `bedtools merge -d 5000`) are not read, and hold the same records for the benchmark's variants | 24 × .osa2 |
 | gnomAD v4.1 gene constraints (.oga) | `--source gnomad_gene` from `gnomad.v4.1.constraint_metrics.tsv` | 18,173 genes |
 | REVEL v1.3 (.osa, per-chrom) | per-chromosome split from `revel-v1.3_all_chromosomes.zip` to bound RAM | 24 × .osa |
-| **SpliceAI (.osa, per-chrom)** | distilled from gnomAD v4.1 INFO field `spliceai_ds_max` (gnomAD v4 already includes SpliceAI scores; no separate download) | 24 × .osa |
-| **PhyloP (.osa, per-chrom)** | distilled from gnomAD v4.1 INFO field `phylop` (Zoonomia 241-mammal score; gnomAD v4 already includes it) | 24 × .osa |
+| **SpliceAI (.osa2, per-chrom)** | distilled from gnomAD v4.1 INFO field `spliceai_ds_max` (gnomAD v4 already includes SpliceAI scores; no separate download) over the whole file (`scripts/extract_gnomad_scores.py`, `--source spliceai --chunk-bits 16`); the `.osa` files of `sa_db/` are not read (`results/complete_databases/README.md`) | 24 × .osa2 |
+| **PhyloP (.osa2, per-chrom)** | distilled from gnomAD v4.1 INFO field `phylop` (Zoonomia 241-mammal score; gnomAD v4 already includes it) over the whole file as above; the `.osa` files of `sa_db/` are not read | 24 × .osa2 |
 | **ClinGen Gene-Disease Validity (.oga)** | `--source omim` from `data/benchmark/sa_sources/clingen_gdv.tsv` (ClinGen public CSV converted to genemap2 layout, **every** classification including Limited/Disputed/Refuted/No Known Disease Relationship, so the gate can tell "curated and found wanting" from "not curated"; keeping only Definitive/Strong/Moderate is what run v10 measured as costing PVS1 on 1,497 truth-pathogenic nulls). **Preferred over OMIM `genemap2.txt`** per ClinGen SVI / Abou Tayoun 2018: ClinGen uses a multi-curator scored rubric that classifies rather than omits weak relationships. Real OMIM `genemap2.txt` is also accepted (registration-gated at omim.org); both populate the same `omim` json_key. | 2,924 genes as built for v27 (a fresh download on 2026-08-31 gives 3,030) |
 | **RepeatMasker (.osi)** | `--source custom_bed --name repeatmasker` from UCSC `rmsk.txt.gz` via `repeatmasker_to_bed.py`. The `--name` must contain `repeat`: the classifier finds the track by key substring, so any other name loads and is ignored. Drives BP3. | 5.3 M intervals |
 
@@ -304,16 +311,17 @@ an alternative: it is fine for ad-hoc per-variant lookups, but
 exponential backoff**, so it cannot replace tabix for the 24 K-region
 extraction.
 
-### Speed (single host, Apple Silicon, release build)
+### Speed (Apple M4, ten cores, release build of 0.5.0, 7 November 2026)
 
 | Stage | Time | Throughput |
 |-------|------|-----------|
-| `fastvep annotate --acmg --pick` on 673,660 variants | **4,103 s (68 min)** | **164 variants/s** |
-| Concordance parse of 0.6 GB bgzipped VCF | ~3 min | — |
+| `fastvep annotate --acmg --pick` on 673,660 variants, every core | **25.3 s** | **26,606 variants/s** (114 s of CPU, 5.3 GiB peak) |
+| the same on one thread | **74 s** | **9,056 variants/s** |
+| Concordance scoring of the 0.6 GB bgzipped VCF (`03_evaluate_concordance.py`) | 11 s | — |
 
-(All 75 SA databases loaded once at process start: 25 gnomAD chroms +
-24 REVEL chroms + 24 SpliceAI chroms + 24 PhyloP chroms + 3 .oga
-gene-level. 99 % CPU during the annotation phase.)
+(All 101 SA databases are loaded once at process start: 24 gnomAD chromosomes +
+24 REVEL + 24 SpliceAI + 24 PhyloP, ClinVar, three .oga
+gene-level databases and the RepeatMasker .osi. The first version of this table (v7, one thread, 4,103 s, 164 variants/s) is superseded; `scripts/19_time_annotation.py` makes this one, and the times of the 42 runs of `results/v38_v0.5.0/`, made three at a time, are in their provenance files.)
 
 The annotation pipeline writes `--output-format vcf` (single-line per
 variant, ACMG annotations carried in CSQ INFO field) and pipes through

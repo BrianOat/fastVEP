@@ -16,6 +16,7 @@ pub mod criteria;
 pub mod disease;
 pub mod functional;
 pub mod sa_extract;
+pub mod sources;
 #[cfg(test)]
 mod test_support;
 pub mod types;
@@ -27,6 +28,7 @@ pub use sa_extract::{
     extract_classification_input, is_pure_insertion, reads_exon_edge, reads_hgvs_placement,
     same_splice_position_pathogenic, ClassificationInput, CompanionVariant, GenotypeInfo,
 };
+pub use sources::{LoadedSources, Source, SourceInfo, SourceScope, REFERENCE_STACK};
 pub use types::{
     AcmgClassification, AcmgResult, DisorderClassification, DisorderRef, EvidenceCounts,
     EvidenceCriterion,
@@ -149,9 +151,10 @@ mod tests {
         let result = classify(&input, &AcmgConfig::default());
         assert_eq!(result.classification, AcmgClassification::Benign);
         assert_eq!(result.shorthand, "B");
-        // BA1 is standalone benign: -8 points, inside the Benign band on its
-        // own. The rule string names the arithmetic under the point system and
-        // the rule id under the table, so assert on the evidence instead.
+        // BA1 is Stand-alone benign, and the 2015 table calls it Benign on its
+        // own. The benign side never uses points, so the rule is "BA1" under
+        // either setting of `use_point_system`: the first assertion checks the
+        // evidence, and the second the rule under the table.
         assert!(result.criteria.iter().any(|c| c.code == "BA1" && c.met));
         let table = AcmgConfig {
             use_point_system: false,
@@ -279,14 +282,14 @@ mod tests {
             ..Default::default()
         });
 
-        // AF = 0.02 is above the PM2 bar, so PM2 does not fire; BS1 is not
+        // AF = 0.02 is above the PM2 threshold, so PM2 does not fire; BS1 is not
         // evaluated because the record carries no AN. That leaves PVS1 alone,
         // and the two combining schemes genuinely disagree about it.
         //
-        // Point system (the default): 8 points, inside the Likely Pathogenic
-        // band. A frameshift in a haploinsufficient disease gene is not an
-        // uncertain finding, and run v10 had 2,319 ClinVar-Pathogenic variants
-        // sitting in VUS on exactly this signature.
+        // Points on the pathogenic side (the default): 8 points, inside the
+        // Likely Pathogenic band. A frameshift in a haploinsufficient disease
+        // gene is not an uncertain finding, and run v10 had 2,319
+        // ClinVar-Pathogenic variants sitting in VUS on exactly this signature.
         assert_eq!(
             classify(&input, &AcmgConfig::default()).classification,
             AcmgClassification::LikelyPathogenic
@@ -402,9 +405,9 @@ mod tests {
 
     #[test]
     fn test_pm2_takes_the_recessive_bar_in_the_recessive_context_only() {
-        // 5e-5 is above the dominant bar (4e-5) and below the recessive one
+        // 5e-5 is above the dominant threshold (4e-5) and below the recessive one
         // (7e-5). The gene is both, so the headline reads it as unknown and
-        // applies the strict bar; each context applies its own.
+        // applies the strict threshold; each context applies its own.
         let input = dual_inheritance_input(GnomadData {
             all_ac: Some(70),
             all_af: Some(5e-5),
@@ -413,7 +416,10 @@ mod tests {
             ..Default::default()
         });
         let result = classify(&input, &AcmgConfig::default());
-        assert!(!met(&result, "PM2"), "the headline stays on the strict bar");
+        assert!(
+            !met(&result, "PM2"),
+            "the headline stays on the strict threshold"
+        );
 
         let codes: Vec<_> = result
             .per_disorder
@@ -433,8 +439,14 @@ mod tests {
                 .expect("context")
                 .result
         };
-        assert!(!met(by("AD"), "PM2"), "5e-5 is above the dominant bar");
-        assert!(met(by("AR"), "PM2"), "5e-5 is below the recessive bar");
+        assert!(
+            !met(by("AD"), "PM2"),
+            "5e-5 is above the dominant threshold"
+        );
+        assert!(
+            met(by("AR"), "PM2"),
+            "5e-5 is below the recessive threshold"
+        );
     }
 
     #[test]

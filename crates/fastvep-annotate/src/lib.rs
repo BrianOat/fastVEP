@@ -8,11 +8,16 @@
 //! the same underlying crates.
 
 mod colocated;
+pub mod coverage;
 mod hgvs_normalize;
 mod hgvsp;
 pub mod pick;
+pub mod sv;
 
 pub use colocated::known_cells;
+pub use coverage::{
+    describe_chromosomes, expected_chromosomes, normalize_chromosome, SourceCoverage,
+};
 pub use hgvs_normalize::{
     clipped_span, convert_ins_to_dup_range, convert_ins_to_dup_range_noncoding, hgvs_allele,
     hgvs_allele_on_transcript, hgvs_placement, hgvsc_shifted, hgvsc_shifted_outcome,
@@ -62,10 +67,18 @@ pub struct AnnotationContext {
     /// every lookup of every provider across concurrent `/annotate` requests
     /// (and which the CLI pipeline worked around by immediately unwrapping).
     pub sa_providers: Vec<Box<dyn AnnotationProvider>>,
+    /// Database files of the SA directory that were found and not loaded, with why. A source that
+    /// is in this list is a source that is missing from every annotation and classification the
+    /// context makes, so whoever serves the context reports it.
+    pub sa_skipped: Vec<SkippedSource>,
     /// Gene-level annotation providers (OMIM, gnomAD gene constraints, ClinVar protein index).
     pub gene_providers: Vec<fastvep_sa::gene::GeneIndex>,
     /// ACMG-AMP classification configuration (None = disabled).
     pub acmg_config: Option<fastvep_classification::AcmgConfig>,
+    /// Read an insertion as the point between `POS` and `POS + 1`, as the VCF specification
+    /// describes it, and not as the interval of its `SVLEN` bases that Ensembl VEP reads (the
+    /// default). See [`fastvep_io::vcf::ParseOptions::insertion_as_point`].
+    pub sv_insertion_as_point: bool,
     /// Curated functional-assay evidence supplying PS3/BS3 (None = not provided).
     ///
     /// PS3 and BS3 are the two criteria that cannot be computed from variant
@@ -219,17 +232,21 @@ impl AnnotationContext {
         let predictor = ConsequencePredictor::new(distance, distance);
 
         // Load supplementary annotation providers (.osa, .osa2 files)
-        let sa_providers = if let Some(dir) = sa_dir {
-            load_sa_providers(Path::new(dir))?
+        let (sa_providers, mut sa_skipped) = if let Some(dir) = sa_dir {
+            load_sa_providers_reporting(Path::new(dir))?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
-        let gene_providers = if let Some(dir) = sa_dir {
-            load_gene_providers(Path::new(dir))?
+        let (gene_providers, skipped_genes) = if let Some(dir) = sa_dir {
+            load_gene_providers_reporting(Path::new(dir))?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        sa_skipped.extend(skipped_genes);
+        for source in &sa_skipped {
+            tracing::warn!("{source}");
+        }
         if let Some(conflict) = check_sa_assemblies(&sa_providers, &gene_providers) {
             tracing::warn!("{conflict}");
         }
@@ -243,39 +260,99 @@ impl AnnotationContext {
             distance,
             hgvs: true,
             sa_providers,
+            sa_skipped,
             gene_providers,
             acmg_config: None,
+            sv_insertion_as_point: false,
         })
+    }
+
+    /// How many transcripts a variant at these coordinates overlaps, with the context's distance
+    /// on each side: the rows its answer has before its alternate alleles multiply them. Counting
+    /// them costs one query of the transcript index and no annotation, which is what lets a
+    /// server size a batch, or refuse a variant, before any work is spent on it.
+    pub fn overlapping_transcripts(&self, chrom: &str, start: u64, end: u64) -> usize {
+        let query_start = start.saturating_sub(self.distance).max(1);
+        let query_end = end.saturating_add(self.distance);
+        self.transcript_provider
+            .get_transcripts(chrom, query_start, query_end)
+            .map_or(0, |transcripts| transcripts.len())
     }
 
     pub fn transcript_count(&self) -> usize {
         self.transcript_provider.transcript_count()
     }
 
-    /// Whether a repeat-interval source (RepeatMasker or equivalent) is loaded.
-    ///
-    /// BP3 needs this to tell "this variant is not in a repeat" from "no repeat
-    /// database was loaded". An interval source only produces an annotation on
-    /// a hit, so those two are indistinguishable from the annotation list alone,
-    /// and reading a miss as the latter makes BP3 report a setup error on every
-    /// in-frame indel outside a repeat.
-    ///
-    /// Matched on the same substrings the classifier uses to find the track, so
-    /// a source named such that this returns `true` is exactly a source BP3 will
-    /// actually read.
-    pub fn repeat_db_loaded(&self) -> bool {
-        self.sa_providers.iter().any(|p| {
-            let k = p.json_key().to_lowercase();
-            k.contains("repeat") || k.contains("repeatmasker") || k.contains("simple_repeat")
-        })
+    /// Which chromosomes the loaded gnomAD databases hold.
+    pub fn coverage(&self) -> SourceCoverage {
+        SourceCoverage::of(&self.sa_providers)
     }
 
-    /// Names of loaded supplementary annotation sources.
+    /// The autosomes and X that the gene model has transcripts on and the loaded gnomAD databases
+    /// hold nothing of, in natural order. Empty when there is nothing to say: no gnomAD database
+    /// is loaded (the sources report that), or the databases hold every chromosome the gene model
+    /// has, or they cannot say which they hold.
+    ///
+    /// A gnomAD of some chromosomes only is loaded and answers "no record" for the rest, which
+    /// PM2 reads as absence from the population; see [`coverage`].
+    pub fn gnomad_lacks(&self) -> Vec<String> {
+        let wanted = expected_chromosomes(self.transcript_provider.chromosomes());
+        self.coverage().gnomad_lacks(&wanted)
+    }
+
+    /// Which sources of the classifier's reference stack are loaded.
+    ///
+    /// The classifier needs this because an annotation says nothing about a source that was
+    /// not opened: a variant with no gnomAD record and a run with no gnomAD database look the
+    /// same, and PM2 reads the first as absence from controls. BP3 is the other reader. An
+    /// interval source only produces an annotation on a hit, so "not in a repeat" and "no
+    /// repeat database was loaded" are indistinguishable from the annotation list alone, and
+    /// reading a miss as the latter makes BP3 report a setup error on every in-frame indel
+    /// outside a repeat.
+    ///
+    /// Matched on the same keys the classifier reads them by (`Source::from_json_key`), so a
+    /// source named such that this says it is loaded is exactly a source the criteria will
+    /// actually read.
+    pub fn loaded_sources(&self) -> fastvep_classification::LoadedSources {
+        fastvep_classification::LoadedSources::from_json_keys(
+            self.sa_providers.iter().map(|p| p.json_key()).chain(
+                self.gene_providers
+                    .iter()
+                    .map(|g| g.header.json_key.as_str()),
+            ),
+        )
+    }
+
+    /// Names of loaded supplementary annotation sources, each once: a source held in a shard
+    /// for every chromosome is one source.
     pub fn sa_source_names(&self) -> Vec<String> {
-        self.sa_providers
-            .iter()
-            .map(|p| p.name().to_string())
-            .collect()
+        let mut names: Vec<String> = Vec::new();
+        for provider in &self.sa_providers {
+            if !names.iter().any(|n| n == provider.name()) {
+                names.push(provider.name().to_string());
+            }
+        }
+        names
+    }
+
+    /// What each loaded source is, once: its key, name, version (the date of the release when it
+    /// dated itself), assembly, and how many files hold it.
+    pub fn sa_source_details(&self) -> Vec<SourceDetail> {
+        let mut details: Vec<SourceDetail> = Vec::new();
+        for provider in &self.sa_providers {
+            let meta = provider.metadata();
+            match details.iter_mut().find(|d| d.key == meta.json_key) {
+                Some(existing) => existing.files += 1,
+                None => details.push(SourceDetail {
+                    key: meta.json_key.clone(),
+                    name: meta.name.clone(),
+                    version: meta.version.clone(),
+                    assembly: meta.assembly.clone(),
+                    files: 1,
+                }),
+            }
+        }
+        details
     }
 
     /// Load a genome from GFF3 path (+ optional FASTA + optional SA directory).
@@ -293,6 +370,7 @@ impl AnnotationContext {
         self.predictor = new_ctx.predictor;
         self.gff3_source = new_ctx.gff3_source;
         self.sa_providers = new_ctx.sa_providers;
+        self.sa_skipped = new_ctx.sa_skipped;
         self.gene_providers = new_ctx.gene_providers;
         Ok(tr_count)
     }
@@ -364,10 +442,17 @@ impl AnnotationContext {
         pick: Option<PickRequest>,
         acmg_config: Option<&fastvep_classification::AcmgConfig>,
     ) -> Result<Vec<serde_json::Value>> {
-        // Computed once: BP3 must distinguish "not in a repeat" from "no repeat
-        // database loaded", and only the context knows which sources are open.
-        let repeat_db_loaded = self.repeat_db_loaded();
-        let mut vcf_parser = VcfParser::new(vcf_text.as_bytes())?;
+        // Computed once: PM2 and BP3 must tell "no record" from "no database", and only the
+        // context knows which sources are open.
+        let sources = self.loaded_sources();
+        // And which chromosomes the gnomAD databases hold: a variant on another has no record
+        // because there is nothing to hold one, which PM2 must not read as absence.
+        let coverage = self.coverage();
+        let mut vcf_parser =
+            VcfParser::new(vcf_text.as_bytes())?.with_options(fastvep_io::vcf::ParseOptions {
+                insertion_as_point: self.sv_insertion_as_point,
+                ..Default::default()
+            });
 
         // Extract sample names from VCF #CHROM header
         let sample_names: Vec<String> = vcf_parser
@@ -390,15 +475,27 @@ impl AnnotationContext {
         let functional_evidence = self.functional_evidence.as_ref();
 
         for vf in &mut variants {
+            // A structural variant is paired with its transcripts, and predicted, as Ensembl VEP
+            // does it (`sv`): by the window of each of its positions and by the class it was given.
+            // `fastvep annotate` asks the same function.
+            if let Some(sequence) = self.seq_provider.as_deref() {
+                sv::expand_tandem_repeat(
+                    vf,
+                    sequence as &dyn SequenceProvider,
+                    Some(fastvep_io::vcf::DEFAULT_MAX_SV_SIZE),
+                );
+            }
+            let sv::Overlap {
+                transcripts: overlapping,
+                predictions: sv_run,
+            } = sv::overlap(&self.transcript_provider, vf, self.distance);
+            let is_sv = vf.sv.is_some();
             let chrom = &vf.position.chromosome;
-            let query_start = vf.position.start.saturating_sub(self.distance).max(1);
-            let query_end = vf.position.end + self.distance;
-            let overlapping = self
-                .transcript_provider
-                .get_transcripts(chrom, query_start, query_end)
-                .unwrap_or_default();
 
-            if overlapping.is_empty() {
+            if is_sv && sv_run.is_none() {
+                // no transcript is paired with it: one `intergenic_variant` for each of its alleles
+                sv::annotate_sv_intergenic(vf);
+            } else if !is_sv && overlapping.is_empty() {
                 // The variant's own HGVSg is there whether or not a transcript is (VEP's
                 // intergenic output ends in the function that writes it), and the transcript
                 // rows of this loop have it under `hgvs`, so these do.
@@ -429,19 +526,28 @@ impl AnnotationContext {
                     }
                 }
             } else {
-                let result = self.predictor.predict(
-                    &vf.position,
-                    &vf.ref_allele,
-                    &vf.alt_alleles,
-                    &overlapping,
-                    None,
-                );
+                let consequences: Vec<fastvep_consequence::TranscriptConsequence> = match sv_run {
+                    // one for each transcript, in the order they were found in, which is the
+                    // order of `overlapping`
+                    Some(predictions) => predictions.into_iter().map(|p| p.consequence).collect(),
+                    None => {
+                        self.predictor
+                            .predict(
+                                &vf.position,
+                                &vf.ref_allele,
+                                &vf.alt_alleles,
+                                &overlapping,
+                                None,
+                            )
+                            .transcript_consequences
+                    }
+                };
 
                 // The reference an HGVS description is written against: the genome's, where the
                 // VCF has `N` and where its REF is not the reference's (`reference_for_hgvs`).
                 // Read only for a run that writes a description, as `fastvep annotate` does: it is
                 // a read of the FASTA for every record.
-                let hgvs_ref = if self.hgvs {
+                let hgvs_ref = if self.hgvs && !is_sv {
                     reference_for_hgvs(
                         self.seq_provider
                             .as_deref()
@@ -458,7 +564,7 @@ impl AnnotationContext {
                 // HGVSg is the variant's, the same on every transcript row, and
                 // reading the reference to place it is not free: made once per
                 // record, as `fastvep annotate` does.
-                let hgvsg_by_alt = if self.hgvs {
+                let hgvsg_by_alt = if self.hgvs && !is_sv {
                     hgvsg_per_alt(
                         self.seq_provider
                             .as_deref()
@@ -473,7 +579,7 @@ impl AnnotationContext {
                     Vec::new()
                 };
 
-                for (i, tc) in result.transcript_consequences.iter().enumerate() {
+                for (i, tc) in consequences.iter().enumerate() {
                     // `predict` returns one consequence per transcript it was
                     // handed, in that order, so index `i` is the match. The
                     // scan is the fallback for a predictor that ever stops
@@ -504,6 +610,7 @@ impl AnnotationContext {
                             .map(|ac| {
                                 let mut ann = AlleleAnnotation {
                                     allele: ac.allele.clone(),
+                                    sv_allele: ac.sv_allele,
                                     consequences: ac.consequences.clone(),
                                     impact: ac.impact,
                                     location: ac.location,
@@ -532,7 +639,8 @@ impl AnnotationContext {
                                 // own position
                                 let mut shift = 0u64;
 
-                                if self.hgvs {
+                                // none of a structural variant's rows has an HGVS description
+                                if self.hgvs && !is_sv {
                                     ann.hgvsg = vf
                                         .alt_alleles
                                         .iter()
@@ -817,7 +925,13 @@ impl AnnotationContext {
             }
 
             // ACMG-AMP classification pass (after all SA annotations are attached)
-            if let Some(acmg_cfg) = acmg_config {
+            //
+            // ACMG-AMP (Richards 2015) is a classification of a sequence change. A structural
+            // variant has the terms of a sequence change in a row (`frameshift_variant` for a
+            // deletion inside an exon, `start_lost` for an inversion over a start codon), and PVS1
+            // would read them as what they are for a base, so it is not given a classification: the
+            // criteria for copy number variants are another document's (Riggs 2020).
+            if let Some(acmg_cfg) = acmg_config.filter(|_| vf.sv.is_none()) {
                 // Parse sample genotypes if trio config is present
                 let trio_genotypes = extract_trio_genotypes(vf, acmg_cfg, &sample_names);
 
@@ -865,7 +979,7 @@ impl AnnotationContext {
                             aa.exon,
                             aa.protein_length,
                             aa.escapes_nmd,
-                            repeat_db_loaded,
+                            coverage.sources_for(sources, &vf.position.chromosome),
                             splice_ps1_evidence(aa, &gene_anns, &query_alleles, alt_idx),
                             alt_idx
                                 .and_then(|i| query_alleles.get(i))
@@ -888,7 +1002,7 @@ impl AnnotationContext {
                             vec![], // companion_variants populated in second pass
                         );
                         let result = fastvep_classification::classify(&input, acmg_cfg);
-                        aa.acmg_classification = serde_json::to_value(&result).ok();
+                        aa.acmg_classification = serde_json::to_value(&result).ok().map(Box::new);
                     }
                 }
             }
@@ -904,7 +1018,8 @@ impl AnnotationContext {
                     acmg_cfg,
                     &sample_names,
                     functional_evidence,
-                    repeat_db_loaded,
+                    sources,
+                    &coverage,
                 );
             }
         }
@@ -928,6 +1043,7 @@ pub fn annotate_sa_only_scaffold(vf: &mut VariationFeature) {
             biotype: "-".into(),
             allele_annotations: vec![AlleleAnnotation {
                 allele: alt.clone(),
+                sv_allele: None,
                 consequences: vec![],
                 impact: fastvep_core::Impact::Modifier,
                 splice: Default::default(),
@@ -978,6 +1094,7 @@ pub fn annotate_intergenic(vf: &mut VariationFeature) {
             biotype: "-".into(),
             allele_annotations: vec![AlleleAnnotation {
                 allele: alt.clone(),
+                sv_allele: None,
                 consequences: vec![Consequence::IntergenicVariant],
                 impact: fastvep_core::Impact::Modifier,
                 splice: Default::default(),
@@ -1075,6 +1192,21 @@ impl SaLookupErrors {
             return;
         }
         map.insert(source.to_string(), (1, err.to_string()));
+    }
+
+    /// `(source, failures, first message)` for every source that has failed a lookup, sorted by
+    /// source: what a server that does not end, and so never prints the summary of the run, reads
+    /// to tell its clients that a database could not answer.
+    pub fn snapshot(&self) -> Vec<(String, u64, String)> {
+        let Ok(map) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<(String, u64, String)> = map
+            .iter()
+            .map(|(source, (count, first))| (source.clone(), *count, first.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
     }
 
     /// One line per source that failed, sorted so the output is reproducible.
@@ -1509,7 +1641,8 @@ fn enrich_compound_het(
     acmg_cfg: &fastvep_classification::AcmgConfig,
     sample_names: &[String],
     functional_evidence: Option<&fastvep_classification::FunctionalEvidenceIndex>,
-    repeat_db_loaded: bool,
+    sources: fastvep_classification::LoadedSources,
+    coverage: &SourceCoverage,
 ) {
     use std::collections::HashMap;
 
@@ -1530,6 +1663,10 @@ fn enrich_compound_het(
     let mut gene_variants: HashMap<String, Vec<VariantGeneInfo>> = HashMap::new();
 
     for (vf_idx, vf) in variants.iter().enumerate() {
+        // a structural variant has no classification to enrich (see the pass above)
+        if vf.sv.is_some() {
+            continue;
+        }
         let trio_genotypes = extract_trio_genotypes(vf, acmg_cfg, sample_names);
         let proband_gt = &trio_genotypes.0;
 
@@ -1711,7 +1848,7 @@ fn enrich_compound_het(
                 aa.exon,
                 aa.protein_length,
                 aa.escapes_nmd,
-                repeat_db_loaded,
+                coverage.sources_for(sources, &vf.position.chromosome),
                 splice_ps1_evidence(aa, &gene_anns, &query_alleles, alt_idx),
                 alt_idx
                     .and_then(|i| query_alleles.get(i))
@@ -1736,7 +1873,7 @@ fn enrich_compound_het(
             let result = fastvep_classification::classify(&input, acmg_cfg);
             variants[info.vf_idx].transcript_variations[info.tv_idx].allele_annotations
                 [info.aa_idx]
-                .acmg_classification = serde_json::to_value(&result).ok();
+                .acmg_classification = serde_json::to_value(&result).ok().map(Box::new);
         }
     }
 }
@@ -1796,6 +1933,64 @@ pub fn check_sa_assemblies(
     )
 }
 
+/// A database file that was found in a `--sa-dir` and not loaded, and why.
+///
+/// Loading does not fail on one: the directory may hold a source that is not needed, and a run is
+/// better served by the others than by none. But a file that is skipped is a source that is
+/// missing, and a run that does not say so classifies and annotates without it as if it had never
+/// been asked for, so every caller of a loader that matters hears about each of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSource {
+    pub path: std::path::PathBuf,
+    /// Why, in words, for a log or a command line: it can carry paths.
+    pub reason: String,
+    /// Why, as a class, for a response that must not carry them.
+    pub kind: SkippedKind,
+}
+
+/// The two ways a database file is found and not loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedKind {
+    /// It opens and holds no record.
+    Empty,
+    /// It could not be opened or read: a truncated copy, a file of another format.
+    Unopenable,
+}
+
+impl SkippedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkippedKind::Empty => "empty",
+            SkippedKind::Unopenable => "unopenable",
+        }
+    }
+}
+
+impl std::fmt::Display for SkippedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} was not loaded: {}", self.path.display(), self.reason)
+    }
+}
+
+/// What a loaded source is, as `GET /api/status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceDetail {
+    pub key: String,
+    pub name: String,
+    pub version: String,
+    pub assembly: String,
+    /// How many files hold it: a source kept in a shard for each chromosome is one source.
+    pub files: usize,
+}
+
+/// What loading a directory of databases produced: the ones that loaded, in path order, and the
+/// ones that were found and skipped, with why.
+pub type LoadedAndSkipped<T> = (Vec<T>, Vec<SkippedSource>);
+
+const EMPTY_DATABASE_REASON: &str = "it holds no records, which is a build that found nothing to \
+     write (every contig name of its input unmatched, or a truncated download) and not a source of \
+     annotations; rebuild it";
+
 /// Load supplementary annotation providers (.osa, .osa2, .osi files) from a
 /// directory.
 ///
@@ -1805,7 +2000,12 @@ pub fn check_sa_assemblies(
 /// startup scale linearly with shard count for no reason. Sorting by path also
 /// makes the provider order - and therefore the output column order - depend on
 /// the file names rather than on directory iteration order.
-pub fn load_sa_providers(sa_dir: &Path) -> Result<Vec<Box<dyn AnnotationProvider>>> {
+///
+/// A file that cannot be opened, or that holds no record, is skipped and returned beside the
+/// providers, in path order, with the reason.
+pub fn load_sa_providers_reporting(
+    sa_dir: &Path,
+) -> Result<LoadedAndSkipped<Box<dyn AnnotationProvider>>> {
     use fastvep_sa::interval::OsiReader;
     use fastvep_sa::reader::SaReader;
     use fastvep_sa::reader_v2::Osa2Reader;
@@ -1816,16 +2016,15 @@ pub fn load_sa_providers(sa_dir: &Path) -> Result<Vec<Box<dyn AnnotationProvider
             "SA directory does not exist: {} (skipping)",
             sa_dir.display()
         );
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let paths = sorted_paths_with_extensions(sa_dir, &["osa2", "osa", "osi"])?;
 
-    // A source that fails to open is skipped with a warning, as before; only
-    // the directory walk itself is fatal.
-    let providers: Vec<Box<dyn AnnotationProvider>> = paths
+    // A source that fails to open is skipped, as before; only the directory walk itself is fatal.
+    let opened: Vec<std::result::Result<Box<dyn AnnotationProvider>, SkippedSource>> = paths
         .par_iter()
-        .filter_map(|path| {
+        .map(|path| {
             let ext = path.extension().and_then(|e| e.to_str());
             let opened: Result<(&str, Box<dyn AnnotationProvider>)> = match ext {
                 Some("osa2") => Osa2Reader::open(path).map(|r| ("SA v2", boxed(r))),
@@ -1835,21 +2034,45 @@ pub fn load_sa_providers(sa_dir: &Path) -> Result<Vec<Box<dyn AnnotationProvider
                 // "just works" via --sa-dir; the OsiReader exposes the same
                 // AnnotationProvider trait, returning AnnotationValue::Interval.
                 Some("osi") => OsiReader::open(path).map(|r| ("SA interval", boxed(r))),
-                _ => return None,
+                _ => unreachable!("only the extensions asked for are listed"),
             };
             match opened {
+                Ok((_, provider)) if provider.is_empty() => Err(SkippedSource {
+                    path: path.clone(),
+                    reason: EMPTY_DATABASE_REASON.to_string(),
+                    kind: SkippedKind::Empty,
+                }),
                 Ok((kind, provider)) => {
                     tracing::info!("Loaded {}: {} ({})", kind, provider.name(), path.display());
-                    Some(provider)
+                    Ok(provider)
                 }
-                Err(e) => {
-                    tracing::warn!("Could not load {}: {}", path.display(), e);
-                    None
-                }
+                Err(e) => Err(SkippedSource {
+                    path: path.clone(),
+                    reason: format!("{e:#}"),
+                    kind: SkippedKind::Unopenable,
+                }),
             }
         })
         .collect();
 
+    let mut providers = Vec::with_capacity(opened.len());
+    let mut skipped = Vec::new();
+    for result in opened {
+        match result {
+            Ok(provider) => providers.push(provider),
+            Err(source) => skipped.push(source),
+        }
+    }
+    Ok((providers, skipped))
+}
+
+/// [`load_sa_providers_reporting`] for a caller that has no use for the list of what was skipped:
+/// each is logged at warning level, which is seen only where a `tracing` subscriber is installed.
+pub fn load_sa_providers(sa_dir: &Path) -> Result<Vec<Box<dyn AnnotationProvider>>> {
+    let (providers, skipped) = load_sa_providers_reporting(sa_dir)?;
+    for source in &skipped {
+        tracing::warn!("{source}");
+    }
     Ok(providers)
 }
 
@@ -1885,23 +2108,31 @@ fn sorted_paths_with_extensions(dir: &Path, exts: &[&str]) -> Result<Vec<std::pa
 
 /// Load gene-level annotation providers (.oga files) from a directory.
 ///
-/// Same ordering and parallelism contract as [`load_sa_providers`].
-pub fn load_gene_providers(sa_dir: &Path) -> Result<Vec<fastvep_sa::gene::GeneIndex>> {
+/// Same ordering and parallelism contract as [`load_sa_providers_reporting`], and the same
+/// accounting for a file that was skipped.
+pub fn load_gene_providers_reporting(
+    sa_dir: &Path,
+) -> Result<LoadedAndSkipped<fastvep_sa::gene::GeneIndex>> {
     use rayon::prelude::*;
 
     if !sa_dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let paths = sorted_paths_with_extensions(sa_dir, &["oga"])?;
 
-    let providers: Vec<fastvep_sa::gene::GeneIndex> = paths
+    let opened: Vec<std::result::Result<fastvep_sa::gene::GeneIndex, SkippedSource>> = paths
         .par_iter()
-        .filter_map(|path| {
+        .map(|path| {
             match std::fs::File::open(path)
                 .map_err(anyhow::Error::from)
                 .and_then(|mut f| fastvep_sa::gene::GeneIndex::read_from(&mut f))
             {
+                Ok(index) if index.is_empty() => Err(SkippedSource {
+                    path: path.clone(),
+                    reason: EMPTY_DATABASE_REASON.to_string(),
+                    kind: SkippedKind::Empty,
+                }),
                 Ok(index) => {
                     tracing::info!(
                         "Loaded gene annotations: {} ({}, {} genes)",
@@ -1909,16 +2140,34 @@ pub fn load_gene_providers(sa_dir: &Path) -> Result<Vec<fastvep_sa::gene::GeneIn
                         path.display(),
                         index.gene_count()
                     );
-                    Some(index)
+                    Ok(index)
                 }
-                Err(e) => {
-                    tracing::warn!("Could not load {}: {}", path.display(), e);
-                    None
-                }
+                Err(e) => Err(SkippedSource {
+                    path: path.clone(),
+                    reason: format!("{e:#}"),
+                    kind: SkippedKind::Unopenable,
+                }),
             }
         })
         .collect();
 
+    let mut providers = Vec::with_capacity(opened.len());
+    let mut skipped = Vec::new();
+    for result in opened {
+        match result {
+            Ok(index) => providers.push(index),
+            Err(source) => skipped.push(source),
+        }
+    }
+    Ok((providers, skipped))
+}
+
+/// [`load_gene_providers_reporting`] for a caller that has no use for the list of what was skipped.
+pub fn load_gene_providers(sa_dir: &Path) -> Result<Vec<fastvep_sa::gene::GeneIndex>> {
+    let (providers, skipped) = load_gene_providers_reporting(sa_dir)?;
+    for source in &skipped {
+        tracing::warn!("{source}");
+    }
     Ok(providers)
 }
 

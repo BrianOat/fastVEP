@@ -5,6 +5,118 @@ ISO 8601. Format loosely follows [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-18
+
+A release about the page and the documents that describe the comparison with Ensembl VEP.
+The page of the web server has an example of 15 variants in cancer genes, and the documents compare fastVEP with Ensembl VEP 116.3 only.
+No consequence, HGVS or ACMG output changes: the program writes the same bytes and the same warnings as 0.6.0 on 15 of the benchmark cases of the repository (`benchmarks/results/v0.6.1/identity_vs_v0.6.0/`).
+
+### Added
+
+- **web**: an example of 15 SNVs in cancer genes (TP53, KRAS, PIK3CA, IDH1, BRCA1, PTEN, MSH2, VHL, CHEK2 and EGFR) that ClinVar (release 2026-11-01) classifies as pathogenic, likely pathogenic or of uncertain significance, so that the table, the ClinVar annotation and the ACMG column can be tried on variants of clinical interest. The chip is shown only when the selected gene model is a full GRCh38 one, because the in-browser demo model has no row for them (#189).
+
+### Changed
+
+- **docs**: `docs/VEP_DIVERGENCE.md`, the README and the migration page compare fastVEP with Ensembl VEP 116.3 only. The measurements against release 115.1 are removed, each divergence carries its 116.3 count, and "Ensembl 115" in the text is said to be the release of the GFF3 and FASTA that both tools read (#188).
+- **validation**: `run_escaping_probe.sh` runs against the 116.3 image, and writes the same rows as it did for 115.1 (#188).
+
+## [0.6.0] - 2026-11-18
+
+A release about structural variants.
+fastVEP annotates them as Ensembl VEP 116.3 does: the same class, interval, transcripts and terms for each record, held to the program itself cell by cell and not to its documentation.
+The structural variants of ClinVar on chromosome 21 score 0.9999 against VEP by the strict F1 of the vep-rs paper (the symbolic alleles scored close to 0 before), and a 1-in-4 sample of gnomAD-SV on that chromosome scores 0.9993 when its contig is spelled one way and 0.9052 as the file is written, because VEP compares contig names letter for letter.
+A run over small variants writes the same bytes as 0.5.0 on every benchmark input of the repository, but for two changes that make it VEP's (`--flag-pick*` and the rank of two splice terms).
+Each entry names the consequence and not the edit.
+
+### Added
+
+- **sv**: structural variants are annotated as VEP 116.3 annotates them: the class of a record (`SVTYPE`, the ALT notation, the copy number and tandem repeat alleles), its interval, the transcripts it is paired with (the mates of a breakend included), the terms of each class and the cells of a row (`Allele` as VEP labels it, `EXON`, `INTRON`, the positions with their totals, `DISTANCE`, `VARIANT_CLASS`); a tandem repeat is read as the bases its INFO describes (#185).
+- **cli**: `--max-sv-size` skips a variant longer than its limit, as VEP's `--max_sv_size` does (10,000,000 bases by default, `-1` for none), and `--sv-insertion-as-point` reads an insertion as the VCF specification describes it, which VEP does not.
+- **docs / validation**: `docs/STRUCTURAL_VARIANTS.md` has the rules and the places where fastVEP is not VEP; `validation/run_sv_world.py` runs both tools over a generated world of any seed and compares them cell by cell (eight seeds, 139,860 rows of VEP 116.3, differ in no row and in no cell but those of divergence 11); `validation/compare_pick.py` says which transcript each tool flags and why they differ.
+- **benchmarks**: `run_identity_sweep.sh` compares builds over 25 cases (every input and flag of the benchmarks), `run_small_variant_regression.sh` times them in turn with instructions retired and peak memory, and `run_sv_head_to_head.sh` times fastVEP and VEP on structural variants.
+
+### Changed
+
+- **core**: the terms of a consequence are the 41 of Ensembl's table. The eight terms of other tools that the enum held (`copy_number_change`, `copy_number_increase`, `copy_number_decrease`, `short_tandem_repeat_change`, `short_tandem_repeat_expansion`, `short_tandem_repeat_contraction`, `unidirectional_gene_fusion`, `transcript_variant`) are gone because nothing in VEP writes them, so a filter on one of them matches nothing, and a structural variant carries VEP's terms (`transcript_amplification`, `feature_truncation`, `inframe_deletion` and the rest).
+- **acmg**: a structural variant is given no ACMG-AMP classification, because its rows have the terms of a sequence change (`frameshift_variant` for a deletion inside an exon) which PVS1 would read as what they are for a base.
+- **web**: a request that lists more repeat alleles than it may hold is refused.
+
+### Fixed
+
+- **pick**: `--flag-pick`, `--flag-pick-allele` and `--flag-pick-allele-gene` flag the `intergenic_variant` rows of a variant that no transcript is beside, so a filter on `PICK is 1` keeps it, as VEP's does: 6,940 of the 50,284 variants of chromosome 22 of HG002 had no flagged row.
+- **consequence**: the ranks of `splice_donor_5th_base_variant` (15) and `splice_region_variant` (16) and the impacts of four regulatory terms are release 116.3's, which changes the `most_severe_consequence` of 3 of the 4,048,342 JSON records of HG002 (VEP writes the donor term for each of them) and the winner of a `--pick` between transcripts that tie on every criterion before the rank.
+- **cache**: a bgzipped, indexed GFF3 is read for the whole of what a structural variant reaches, and a record whose end lies past what a `.tbi` addresses no longer leaves its contig with no transcript, which made every variant on it intergenic with exit code 0.
+
+### Still different from VEP
+
+How `--pick` breaks a tie differs: where every criterion before it ties, VEP keeps the transcript with the longer sequence and fastVEP the one with the lower ID, so 0.6 to 2.4 % of the picks on chromosome 22 of HG002 are another transcript (`docs/VEP_DIVERGENCE.md`, Part 2).
+
+
+## [0.6.0] - 2026-11-18
+
+A release about structural variants.
+fastVEP annotates them as Ensembl VEP 116.3 does: the same class, interval, transcripts and terms for each record, held to the program itself cell by cell and not to its documentation.
+The structural variants of ClinVar on chromosome 21 score 0.9999 against VEP by the strict F1 of the vep-rs paper (the symbolic alleles scored close to 0 before), and a 1-in-4 sample of gnomAD-SV on that chromosome scores 0.9993 when its contig is spelled one way and 0.9052 as the file is written, because VEP compares contig names letter for letter.
+A run over small variants writes the same bytes as 0.5.0 on every benchmark input of the repository, but for two changes that make it VEP's (`--flag-pick*` and the rank of two splice terms).
+Each entry names the consequence and not the edit.
+
+### Added
+
+- **sv**: structural variants are annotated as VEP 116.3 annotates them: the class of a record (`SVTYPE`, the ALT notation, the copy number and tandem repeat alleles), its interval, the transcripts it is paired with (the mates of a breakend included), the terms of each class and the cells of a row (`Allele` as VEP labels it, `EXON`, `INTRON`, the positions with their totals, `DISTANCE`, `VARIANT_CLASS`); a tandem repeat is read as the bases its INFO describes (#185).
+- **cli**: `--max-sv-size` skips a variant longer than its limit, as VEP's `--max_sv_size` does (10,000,000 bases by default, `-1` for none), and `--sv-insertion-as-point` reads an insertion as the VCF specification describes it, which VEP does not.
+- **docs / validation**: `docs/STRUCTURAL_VARIANTS.md` has the rules and the places where fastVEP is not VEP; `validation/run_sv_world.py` runs both tools over a generated world of any seed and compares them cell by cell (eight seeds, 139,860 rows of VEP 116.3, differ in no row and in no cell but those of divergence 11); `validation/compare_pick.py` says which transcript each tool flags and why they differ.
+- **benchmarks**: `run_identity_sweep.sh` compares builds over 25 cases (every input and flag of the benchmarks), `run_small_variant_regression.sh` times them in turn with instructions retired and peak memory, and `run_sv_head_to_head.sh` times fastVEP and VEP on structural variants.
+
+### Changed
+
+- **core**: the terms of a consequence are the 41 of Ensembl's table. The eight terms of other tools that the enum held (`copy_number_change`, `copy_number_increase`, `copy_number_decrease`, `short_tandem_repeat_change`, `short_tandem_repeat_expansion`, `short_tandem_repeat_contraction`, `unidirectional_gene_fusion`, `transcript_variant`) are gone because nothing in VEP writes them, so a filter on one of them matches nothing, and a structural variant carries VEP's terms (`transcript_amplification`, `feature_truncation`, `inframe_deletion` and the rest).
+- **acmg**: a structural variant is given no ACMG-AMP classification, because its rows have the terms of a sequence change (`frameshift_variant` for a deletion inside an exon) which PVS1 would read as what they are for a base.
+- **web**: a request that lists more repeat alleles than it may hold is refused.
+
+### Fixed
+
+- **pick**: `--flag-pick`, `--flag-pick-allele` and `--flag-pick-allele-gene` flag the `intergenic_variant` rows of a variant that no transcript is beside, so a filter on `PICK is 1` keeps it, as VEP's does: 6,940 of the 50,284 variants of chromosome 22 of HG002 had no flagged row.
+- **consequence**: the ranks of `splice_donor_5th_base_variant` (15) and `splice_region_variant` (16) and the impacts of four regulatory terms are release 116.3's, which changes the `most_severe_consequence` of 3 of the 4,048,342 JSON records of HG002 (VEP writes the donor term for each of them) and the winner of a `--pick` between transcripts that tie on every criterion before the rank.
+- **cache**: a bgzipped, indexed GFF3 is read for the whole of what a structural variant reaches, and a record whose end lies past what a `.tbi` addresses no longer leaves its contig with no transcript, which made every variant on it intergenic with exit code 0.
+
+### Still different from VEP
+
+How `--pick` breaks a tie differs: where every criterion before it ties, VEP keeps the transcript with the longer sequence and fastVEP the one with the lower ID, so 0.6 to 2.4 % of the picks on chromosome 22 of HG002 are another transcript (`docs/VEP_DIVERGENCE.md`, Part 2).
+
+
+## [0.5.0] - 2026-11-11
+
+A release about speed and about reading what Ensembl VEP 116 reads.
+Open Targets measured the release candidate at 5 to 7 times faster than v0.4.0 on a release of 7.9 million variants, with byte-identical output, and a migrated `vep` command line now runs as typed and writes the columns VEP writes.
+As in 0.4.0, most of the fixes are a wrong answer that looked right: a start loss written as the wrong HGVSp, a RefSeq transcript named as VEP would not name it, a known variant reported as novel.
+Each entry names the consequence and not the edit.
+
+### Added
+
+- **cli / io**: VEP's optional columns in tab output in VEP's order, HGVSg and HGVS_OFFSET as VEP writes them, and the known-variant columns (AF, MAX_AF, CLIN_SIG, SOMATIC, PHENO, PUBMED) as VEP 116 works them out per allele (#139).
+- **cli**: `--total_length`, `--no_escape`, `--force_overwrite`, VEP's underscore spellings of shared flags (`--af_1kg --check_existing`), and the exclusion of readthrough, artifact and predicted transcripts, so that a migrated `vep` command line runs (#139).
+- **web**: every hosted genome is served per request, ACMG is offered only where its reference stack is whole, and what one request may cost is bounded (#175).
+- **acmg**: the mode of inheritance that ClinGen curates is read, and a gene is classified against each of its modes of inheritance.
+- **benchmark / validation / manuscript**: the ACMG benchmark, its manuscript and the head-to-head with Ensembl VEP 116.3 are scripted, and a number in the text is checked against the data that measured it.
+
+### Changed
+
+- **performance**: the transcript cache is written as zstd frames with a table and decoded side by side, a damaged cache is refused where it used to load or abort, and a small run takes a quarter of the time (#166).
+- **performance**: the `fastvep` binary uses mimalloc, a run of 100,000 variants takes 19 to 34% less time, and a run with a large `--distance` does a third of the work because transcripts are chosen before their rows are built (#166, #168).
+- **performance**: tab rows are written into one buffer, batches are formatted on every thread and written in order, known variants are looked up per thread, and many smaller allocations were removed from the per-variant loop (#139).
+
+### Fixed
+
+- **cache**: VEP's `.csi` index is read and known variants are matched as VEP matches them, so `--cache-dir` stops reporting known variants as novel (#142).
+- **gff**: RefSeq transcripts, genes, biotypes and protein versions are named as Ensembl VEP names them, and a transcript carries the symbol source, canonical flag, MANE accession and CDS state that VEP's own caches give it (#139).
+- **consequence / hgvs**: consequences at a start or stop codon, across an intron, in an intron of 13 bases or fewer, and for a deletion of a whole transcript are those of VEP 116, with HGVSc and HGVSp written to match (p.Met1? for a lost initiator) (#139).
+- **io**: ALT alleles are upper-cased, an ALT that repeats the reference is no allele, a lone indel is minimised from both ends, and `*`, gVCF placeholders and `N` are no longer annotated as variants (#139).
+- **sv**: every transcript is no longer dropped when VCF and GFF3 contigs differ by a `chr` prefix (#132, #135).
+- **sa**: GRCh37 coordinates for REVEL and dbNSFP, a warning when one `--sa-dir` mixes assemblies, and gene databases written in symbol order (#133, #136, #137, #138).
+- **acmg**: HGVS placement for indels, the BP7 exon edge and BS2's carrier bar were answered from the round-6 review (#140).
+- **web**: the demo model no longer calls a BRCA2 stop codon intergenic, compares chromosome names without a `chr` prefix, and a pasted `CHROM POS ID REF ALT` line annotates instead of failing or reading as zero variants (#176, #180).
+- **benchmarks**: `run_benchmark.sh` no longer dies at its first echo, needs bash 4, writes a sixth column or times a failed run as a fast one.
+
 ## [0.4.0] — 2026-09-24
 
 A correctness release. Most of what follows is a wrong answer that looked

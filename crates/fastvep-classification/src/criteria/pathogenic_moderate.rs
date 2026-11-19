@@ -261,15 +261,15 @@ fn evaluate_pm1(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
 /// PM2: Absent from controls, or at extremely low frequency.
 ///
 /// ClinGen SVI PM2 v1.0 (Sept 2020) downgrades the strength to Supporting (the default
-/// here) and gives no frequency for any inheritance. The bars are this project's
+/// here) and gives no frequency for any inheritance. The thresholds are this project's
 /// choice, and the recessive-only one equals the Hearing Loss VCEP's (GN005):
 /// - Use raw gnomAD allele frequency (NOT filtering allele frequency / FAF).
-/// - The bar depends on inheritance:
+/// - The threshold depends on inheritance:
 ///     * every gene not read as recessive-only (dominant, both, unknown):
 ///       `pm2_ad_af_threshold`, 4e-5 by default;
 ///     * a gene read as recessive-only: `pm2_ar_af_threshold`, 7e-5 by default.
 ///
-/// Both bars were swept for the ACMG manuscript (`manuscript/acmg`, Section 3.3).
+/// Both thresholds were swept for the ACMG manuscript (`manuscript/acmg`, Section 3.3).
 ///
 /// Inheritance is read from the gene's disease annotation (`OmimData::inheritance`):
 /// ClinGen's curated mode of inheritance for a ClinGen curation, and the words of
@@ -430,9 +430,10 @@ fn evaluate_pm2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
         // Configurable via `pm2_absent_when_no_record` (default true).
         // Set false for partial-coverage runs where gnomAD .osa covers
         // only some input regions and you want PM2 silenced outside that
-        // coverage. Note that when `--sa-dir` includes no gnomAD .osa at
-        // all, `input.gnomad` is None for every variant — disable this
-        // flag in that case (or load gnomAD) to avoid firing PM2 globally.
+        // coverage. A run that has no gnomAD database at all never reaches
+        // this branch: `data_blocker` declines first (`sources.gnomad`), so
+        // the flag no longer has to be turned off to keep PM2 from firing
+        // for every variant of such a run.
         details.insert("gnomad_allAf".into(), serde_json::Value::Null);
         details.insert("pm2_absent_when_no_record".into(), serde_json::json!(true));
 
@@ -441,7 +442,7 @@ fn evaluate_pm2(input: &ClassificationInput, config: &AcmgConfig) -> EvidenceCri
         // is not extremely rare, the "absent" assumption is wrong — do not
         // fire PM2. This catches common variants that silently fail to match
         // gnomAD (e.g. indels: GIGYF2, NOTCH2; or coverage gaps: ASPM,
-        // TOR1AIP1) in the ClinVar 2★+ benchmark. The bar is the PM2 rarity
+        // TOR1AIP1) in the ClinVar 2★+ benchmark. The threshold is the PM2 rarity
         // threshold, floored at the AR "extremely rare" cutoff so the AD
         // strict-absence case (threshold 0.0) doesn't reject on noise.
         let crosscheck_cutoff = threshold.max(config.pm2_ar_af_threshold);
@@ -1157,7 +1158,7 @@ mod tests {
 
     #[test]
     fn test_pm2_no_gnomad_record_still_fires_when_clinvar_af_rare() {
-        // A ClinVar AF below the rarity bar does not block PM2.
+        // A ClinVar AF below the rarity threshold does not block PM2.
         let mut input = make_input(vec![Consequence::MissenseVariant], None);
         input.clinvar = Some(ClinvarData {
             af_tgp: Some(0.00001),
@@ -1165,6 +1166,54 @@ mod tests {
         });
         let result = evaluate_pm2(&input, &AcmgConfig::default());
         assert!(result.met);
+    }
+
+    #[test]
+    fn test_pm2_is_not_evaluated_when_no_gnomad_database_is_loaded_whatever_the_setting() {
+        // A variant has no gnomAD record because nothing was asked, which is not the same as gnomAD
+        // having seen no carrier, and `pm2_absent_when_no_record` is about the second. Reading the
+        // first as absence met PM2 for every variant of a run that never opened gnomAD.
+        for absent_when_no_record in [true, false] {
+            let cfg = AcmgConfig {
+                pm2_absent_when_no_record: absent_when_no_record,
+                ..Default::default()
+            };
+            let mut input = make_input(vec![Consequence::MissenseVariant], None);
+            input.sources = crate::sources::LoadedSources::from_json_keys(["clinvar", "revel"]);
+            let result = evaluate_pm2(&input, &cfg);
+            assert!(!result.met, "{result:?}");
+            assert!(!result.evaluated, "{result:?}");
+            assert!(
+                result.summary.contains("no gnomAD database is loaded"),
+                "{}",
+                result.summary
+            );
+        }
+    }
+
+    #[test]
+    fn test_pm2_is_not_evaluated_on_a_chromosome_the_loaded_gnomad_holds_nothing_of() {
+        // A gnomAD of chromosome X alone, which is what deploy-full.sh once built, is open and says
+        // "no record" for every variant of chromosomes 1 to 22. That is not absence from the
+        // population, and the stack as a whole is complete, so only the variant knows.
+        let cfg = AcmgConfig::default();
+        let mut covered = make_input(vec![Consequence::MissenseVariant], None);
+        covered.variant_coordinates = Some(("X".into(), 1_000, "A".into(), "G".into()));
+        let met = evaluate_pm2(&covered, &cfg);
+        assert!(met.met && met.evaluated, "{met:?}");
+
+        let mut uncovered = make_input(vec![Consequence::MissenseVariant], None);
+        uncovered.variant_coordinates = Some(("1".into(), 1_000, "A".into(), "G".into()));
+        uncovered.sources =
+            crate::sources::LoadedSources::all().without_coverage(crate::sources::Source::Gnomad);
+        let result = evaluate_pm2(&uncovered, &cfg);
+        assert!(!result.met, "{result:?}");
+        assert!(!result.evaluated, "{result:?}");
+        assert!(
+            result.summary.contains("holds no record of chromosome 1"),
+            "{}",
+            result.summary
+        );
     }
 
     #[test]
@@ -1287,7 +1336,7 @@ mod tests {
 
     #[test]
     fn test_pm2_ad_gene_above_the_bar_still_does_not_fire() {
-        // The bar has to keep rejecting something, or it is not a bar.
+        // The threshold has to keep rejecting something, or it is not a threshold.
         let result = evaluate_pm2(&dominant_at(0.0005, 400), &AcmgConfig::default());
         assert!(!result.met, "got: {}", result.summary);
     }
@@ -1728,7 +1777,7 @@ mod tests {
     }
 
     /// PAH's ClinGen curation is "phenylketonuria", tagged AR. The label does not
-    /// say recessive, and before the tag was read PM2 applied the dominant bar to
+    /// say recessive, and before the tag was read PM2 applied the dominant threshold to
     /// it and withheld PM2 from every variant between 4e-5 and 7e-5.
     #[test]
     fn test_pm2_takes_the_recessive_bar_from_the_curated_tag() {
@@ -1743,7 +1792,7 @@ mod tests {
         assert!(ar.met, "{}", ar.summary);
         assert_eq!(ar.details["inheritance_basis"], serde_json::json!("AR"));
 
-        // The same frequency in an AD gene is above its bar.
+        // The same frequency in an AD gene is above its threshold.
         let ad = evaluate_pm2(
             &at_in_gene(
                 6e-5,
